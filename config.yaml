@@ -37,8 +37,9 @@ airspace:
     backoff_max_min: 240
   proximity_alert:
     enabled: true
-    radius_km: 5
-    check_interval_sec: 15
+    radius_m: 5000
+    check_interval_s: 15
+    snooze_minutes: 10
   openaip:
     api_key: "e4c323fcf6475153b43adca8a46300ef"            # TODO: fill in if using OpenAIP
     endpoint: "https://api.core.openaip.net/api/airspaces"
