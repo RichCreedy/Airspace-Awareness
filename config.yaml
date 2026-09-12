@@ -1,19 +1,25 @@
 gps:
-  device: /dev/ttyAMA0
-  baud: 9600
-  use_gpsd: true
-
+  gpsd_host: localhost
+  gpsd_port: 2947
+  reconnect_delay_s: 5
+  poll_timeout_s: 0.5
+  fix_timeout_s: 10          # used by fusion.py
+  
 adsb:
-  endpoint: "http://localhost/data/aircraft.json"
-  poll_interval_sec: 2
+  url: "http://127.0.0.1/tar1090/data/aircraft.json"   # ⚠️ verify exact path
+  poll_interval_s: 2
+  timeout_s: 3
+  backoff_base_s: 2
+  backoff_max_s: 60
+  stale_after_s: 30          # used by fusion.py
 
 wifi:
-  interface: "wlan0mon"   # TODO: set to your monitor-mode iface
-  channel_hop: [1, 6, 11]
+  interface: wlan1mon
+  sniff_burst_s: 1
 
 bluetooth:
-  scan_timeout_sec: 5
-  service_uuid: "0000fffa-0000-1000-8000-00805f9b34fb"
+  adapter: null              # null = Bleak default adapter
+  scan_restart_s: 30
 
 tiles:
   mode: hybrid            # online | offline | hybrid
@@ -43,6 +49,9 @@ disclaimer:
 
 fusion:
   stale_timeout_sec: 30
+
+remoteid:
+  stale_after_s: 20          # used by fusion.py
 
 logging:
   level: INFO
