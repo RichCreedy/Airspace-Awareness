@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+data/tiles/
+data/notam/*.raw
+*.log
+config.local.yaml
+.DS_Store
