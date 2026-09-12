@@ -1,395 +1,398 @@
 """
-modules/fusion.py — Shared state hub for tracks, GPS fix, zones, alerts
+modules/fusion.py — Thread-safe shared-state fusion hub
 
-Thread-safety model:
-  - Single `threading.RLock` guards all mutable state
-  - Writers (GPS/WiFi/BT/ADS-B/AirspaceManager/ProximityAlertMonitor)
-    call update_*() methods — fast, lock-held-briefly
-  - Readers (GUI, ProximityAlertMonitor) call get_*() / get_snapshot()
-    which return *copies*, never live references, so the GUI can
-    iterate without holding the lock
+Central point where all sensor/data sources converge:
+    - GPS fix (ownship position)
+    - ADS-B tracks (from modules/adsb_ingest.py, polling tar1090's
+      aircraft.json)
+    - Remote ID tracks from passive WiFi capture (modules/wifi_capture.py)
+      and Bluetooth capture (modules/bt_capture.py) — merged by
+      `basic_id` when both sources report the same drone
+    - Geofence/NOTAM/FRZ zones (from modules/airspace_manager.py)
+    - Proximity alerts (from modules/proximity_alert.py)
 
-Track identity & merging:
-  - ADS-B tracks are keyed by ICAO hex (unique per aircraft)
-  - Remote ID tracks are keyed by `basic_id` (UAS ID from ASTM F3411)
-  - If the *same* basic_id is seen via both WiFi and Bluetooth, the
-    tracks are merged into one, with `sources` recording both — this
-    avoids showing the same drone twice on the map
+Design notes:
+    - All mutating/reading methods are protected by a single RLock.
+      This module is intentionally simple/coarse-grained rather than
+      lock-per-field, since update frequency is low (~1-10 Hz) relative
+      to typical GUI/CPU budgets on uConsole hardware.
+    - A background thread periodically prunes stale tracks based on
+      per-source timeouts (start()/stop() control this thread).
+    - get_snapshot() is the single method the GUI render loop should
+      call once per frame — it returns a fully-merged, position-filtered,
+      icon-resolved view of the world, so gui/app.py does not need to
+      know about merging logic at all.
 
-Staleness / pruning:
-  - Each track records `last_seen` (monotonic time)
-  - A background daemon thread prunes tracks older than their
-    source's configured timeout, once per `prune_interval_s`
+ASSUMPTIONS (flagged — confirm against actual capture module output):
+    - ADS-B tracks arrive via update_adsb_tracks(list_of_dicts), each
+      dict having at minimum: {"icao": str, "lat": float, "lon": float}
+      and optionally "callsign", "altitude_m", "heading", "speed_mps".
+      This is an upsert (not replace) — entries not present in a given
+      call remain until they age out via ADSB_TIMEOUT_S. This matches
+      tar1090 polling behaviour (a single poll glitch shouldn't cause a
+      track to vanish and reappear).
+    - Remote ID tracks arrive via update_remoteid(source, track), where
+      source is "wifi" or "bluetooth", and track has at minimum:
+      {"track_key": str} (a stable per-session identifier — e.g. MAC
+      address) and optionally "basic_id" (str, the ASTM F3411 UAS ID —
+      once decoded), "lat", "lon", "altitude_m", "heading", "speed_mps".
+      Merging across wifi+bluetooth ONLY happens when both sides report
+      the same non-empty basic_id. Until a basic_id is decoded, tracks
+      are tracked individually by (source, track_key).
 """
 
 from __future__ import annotations
 
-import time
 import logging
 import threading
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any, Optional
+import time
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Optional
 
-LOG = logging.getLogger("fusion")
+LOG = logging.getLogger("modules.fusion")
 
+# ----------------------------------------------------------------------
+# Icon constants
+# ----------------------------------------------------------------------
+ICON_PLANE = "images/icons/plane_blue.png"
+ICON_DRONE_CROSS_VERIFIED = "images/icons/drone_orange.png"   # wifi + bt agree on basic_id
+ICON_DRONE_SINGLE_SOURCE = "images/icons/drone_purple.png"     # basic_id known, one source
+ICON_UNKNOWN = "images/icons/unknown_grey.png"                 # no confirmed identity
+ICON_OWNSHIP = "images/icons/ownship.png"                      # for GUI's own use
 
-# ---------------------------------------------------------------------------
-# Enums / constants
-# ---------------------------------------------------------------------------
-class TrackSource(str, Enum):
-    ADSB = "adsb"
-    WIFI = "wifi"
-    BLUETOOTH = "bluetooth"
-
-
-class TrackType(str, Enum):
-    AIRCRAFT = "aircraft"
-    DRONE_VERIFIED = "drone_verified"      # Remote ID with location + basic_id
-    DRONE_PARTIAL = "drone_partial"        # Remote ID seen, location/type incomplete
-    UNKNOWN = "unknown"
-
-
-ICON_MAP = {
-    TrackType.AIRCRAFT: "images/icons/plane_blue.png",
-    TrackType.DRONE_VERIFIED: "images/icons/drone_orange.png",
-    TrackType.DRONE_PARTIAL: "images/icons/drone_purple.png",
-    TrackType.UNKNOWN: "images/icons/unknown_grey.png",
+# ----------------------------------------------------------------------
+# Default per-source timeouts / intervals
+# ----------------------------------------------------------------------
+DEFAULT_TIMEOUTS_S = {
+    "adsb": 60.0,
+    "remoteid": 45.0,
+    "gps": 15.0,
 }
-OWNSHIP_ICON = "images/icons/ownship.png"
+DEFAULT_PRUNE_INTERVAL_S = 5.0
 
 
-# ---------------------------------------------------------------------------
-# Track dataclass
-# ---------------------------------------------------------------------------
-@dataclass
-class Track:
-    track_id: str                       # ICAO hex or Remote ID basic_id
-    sources: set[TrackSource] = field(default_factory=set)
-    track_type: TrackType = TrackType.UNKNOWN
-
-    lat: Optional[float] = None
-    lon: Optional[float] = None
-    alt_m: Optional[float] = None
-    heading_deg: Optional[float] = None
-    speed_mps: Optional[float] = None
-
-    callsign: Optional[str] = None      # ADS-B callsign
-    basic_id: Optional[str] = None      # Remote ID UAS ID
-    ua_type: Optional[str] = None       # Remote ID UA type string, if known
-
-    last_seen: float = field(default_factory=time.monotonic)
-    first_seen: float = field(default_factory=time.monotonic)
-    raw: dict[str, Any] = field(default_factory=dict)  # last raw payload, for debugging
-
-    def age_s(self) -> float:
-        return time.monotonic() - self.last_seen
-
-    def has_position(self) -> bool:
-        return self.lat is not None and self.lon is not None
+def _monotonic() -> float:
+    return time.monotonic()
 
 
-# ---------------------------------------------------------------------------
-# FusionEngine
-# ---------------------------------------------------------------------------
-class FusionEngine:
-    """Central thread-safe store for GPS fix, tracks, zones, and alerts."""
+def _iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
 
-    def __init__(self, config: dict):
-        self.config = config
+
+class Fusion:
+    def __init__(self, timeouts: Optional[Dict[str, float]] = None,
+                 prune_interval_s: float = DEFAULT_PRUNE_INTERVAL_S):
         self._lock = threading.RLock()
 
-        # --- GPS ---
+        self._timeouts = dict(DEFAULT_TIMEOUTS_S)
+        if timeouts:
+            self._timeouts.update(timeouts)
+        self._prune_interval_s = prune_interval_s
+
+        # --- ADS-B: keyed by icao ---
+        self._adsb: Dict[str, dict] = {}
+
+        # --- Remote ID: keyed by track_key, one dict per source ---
+        self._remoteid_wifi: Dict[str, dict] = {}
+        self._remoteid_bt: Dict[str, dict] = {}
+
+        # --- GPS fix (single latest value) ---
         self._gps_fix: Optional[dict] = None
-        self._gps_fix_timeout_s = config.get("gps", {}).get("fix_timeout_s", 10)
 
-        # --- Tracks ---
-        self._tracks: dict[str, Track] = {}
-        self._adsb_stale_after_s = config.get("adsb", {}).get("stale_after_s", 30)
-        self._remoteid_stale_after_s = config.get("remoteid", {}).get("stale_after_s", 20)
+        # --- Zones / alerts (pushed wholesale by other modules) ---
+        self._zones: List[dict] = []
+        self._alerts: List[dict] = []
 
-        # --- Zones (geofences / FRZ / NOTAM-derived) ---
-        self._zones: list[dict] = []          # list of GeoJSON-like features
-        self._zones_updated_at: Optional[float] = None
-
-        # --- Proximity alerts ---
-        self._proximity_alerts: list[dict] = []
-        self._proximity_updated_at: Optional[float] = None
-
-        # --- Background pruning ---
-        self._prune_interval_s = config.get("fusion", {}).get("prune_interval_s", 5)
+        # --- Background pruning thread control ---
         self._stop_event = threading.Event()
-        self._prune_thread: Optional[threading.Thread] = None
+        self._thread: Optional[threading.Thread] = None
 
-    # =======================================================================
+    # ------------------------------------------------------------------
     # Lifecycle
-    # =======================================================================
+    # ------------------------------------------------------------------
     def start(self):
-        """Start the background pruning thread. Call once from main.py."""
-        if self._prune_thread and self._prune_thread.is_alive():
+        """Start the background pruning thread. Idempotent."""
+        if self._thread and self._thread.is_alive():
+            LOG.warning("Fusion.start() called but pruning thread already running")
             return
+        LOG.info("Starting fusion pruning thread (interval=%.1fs)", self._prune_interval_s)
         self._stop_event.clear()
-        self._prune_thread = threading.Thread(
-            target=self._prune_loop, name="fusion_prune", daemon=True
-        )
-        self._prune_thread.start()
-        LOG.info("FusionEngine pruning thread started (interval=%ss)",
-                 self._prune_interval_s)
+        self._thread = threading.Thread(target=self._prune_loop, name="fusion-prune", daemon=True)
+        self._thread.start()
 
     def stop(self):
+        """Stop the background pruning thread and wait for it to exit."""
+        LOG.info("Stopping fusion pruning thread")
         self._stop_event.set()
-        if self._prune_thread:
-            self._prune_thread.join(timeout=3)
+        if self._thread:
+            self._thread.join(timeout=5)
+            if self._thread.is_alive():
+                LOG.warning("Fusion pruning thread did not stop within timeout")
 
     def _prune_loop(self):
         while not self._stop_event.is_set():
             try:
-                self._prune_stale_tracks()
+                self._prune_once()
             except Exception:
-                LOG.exception("Error during track pruning")
-            self._stop_event.wait(self._prune_interval_s)
+                LOG.exception("Error during fusion prune cycle")
+            self._stop_event.wait(timeout=self._prune_interval_s)
 
-    # =======================================================================
-    # GPS fix
-    # =======================================================================
-    def update_gps_fix(self, fix: dict):
-        """
-        Called by GPSReader. Expected shape:
-          {"lat": float, "lon": float, "alt_m": float,
-           "speed_mps": float, "track_deg": float, "mode": int, "time": str}
-        """
+    def _prune_once(self):
+        now = _monotonic()
         with self._lock:
-            fix = dict(fix)
-            fix["_received_at"] = time.monotonic()
-            self._gps_fix = fix
+            self._prune_dict(self._adsb, now, self._timeouts["adsb"], "ADS-B")
+            self._prune_dict(self._remoteid_wifi, now, self._timeouts["remoteid"], "RemoteID/WiFi")
+            self._prune_dict(self._remoteid_bt, now, self._timeouts["remoteid"], "RemoteID/BT")
+
+    @staticmethod
+    def _prune_dict(store: Dict[str, dict], now: float, timeout_s: float, label: str):
+        stale = [k for k, v in store.items() if (now - v.get("last_seen", 0)) > timeout_s]
+        for k in stale:
+            LOG.debug("Pruning stale %s track: %s", label, k)
+            del store[k]
+
+    # ------------------------------------------------------------------
+    # GPS fix
+    # ------------------------------------------------------------------
+    def update_gps_fix(self, lat: float, lon: float, *,
+                        altitude_m: Optional[float] = None,
+                        heading: Optional[float] = None,
+                        speed_mps: Optional[float] = None,
+                        fix_quality: Optional[str] = None):
+        with self._lock:
+            self._gps_fix = {
+                "lat": lat,
+                "lon": lon,
+                "altitude_m": altitude_m,
+                "heading": heading,
+                "speed_mps": speed_mps,
+                "fix_quality": fix_quality,
+                "last_seen": _monotonic(),
+                "last_seen_iso": _iso_now(),
+            }
 
     def get_gps_fix(self) -> Optional[dict]:
-        """Returns a copy of the latest GPS fix, or None if stale/unset."""
         with self._lock:
             if self._gps_fix is None:
                 return None
-            age = time.monotonic() - self._gps_fix["_received_at"]
-            if age > self._gps_fix_timeout_s:
-                return None
-            return dict(self._gps_fix)
+            fix = dict(self._gps_fix)
+        fix["age_s"] = _monotonic() - fix["last_seen"]
+        fix["stale"] = fix["age_s"] > self._timeouts["gps"]
+        return fix
 
-    def has_valid_fix(self) -> bool:
-        return self.get_gps_fix() is not None
-
-    # =======================================================================
-    # ADS-B tracks (bulk update each poll)
-    # =======================================================================
-    def update_adsb_tracks(self, aircraft_list: list[dict]):
+    # ------------------------------------------------------------------
+    # ADS-B
+    # ------------------------------------------------------------------
+    def update_adsb_tracks(self, tracks: List[dict]):
         """
-        Called by ADSBIngest with the parsed contents of aircraft.json's
-        "aircraft" list. Each entry expected to have at least "hex".
+        Upsert a batch of ADS-B tracks. Each dict must contain 'icao'.
+        Tracks NOT in this batch are left alone (they age out naturally
+        via the prune thread) — this matches tar1090 polling semantics
+        where a momentary poll glitch shouldn't drop a track.
         """
-        now = time.monotonic()
+        now = _monotonic()
         with self._lock:
-            for ac in aircraft_list:
-                hex_id = ac.get("hex")
-                if not hex_id:
+            for track in tracks:
+                icao = track.get("icao") or track.get("hex")
+                if not icao:
+                    LOG.debug("Skipping ADS-B track with no icao/hex identifier: %r", track)
                     continue
+                entry = dict(track)
+                entry["last_seen"] = now
+                self._adsb[icao] = entry
 
-                track = self._tracks.get(hex_id)
-                if track is None:
-                    track = Track(track_id=hex_id, track_type=TrackType.AIRCRAFT)
-                    self._tracks[hex_id] = track
-
-                track.sources.add(TrackSource.ADSB)
-                track.track_type = TrackType.AIRCRAFT
-                track.lat = ac.get("lat", track.lat)
-                track.lon = ac.get("lon", track.lon)
-                track.alt_m = _feet_to_m(ac.get("alt_baro")) if ac.get("alt_baro") else track.alt_m
-                track.heading_deg = ac.get("track", track.heading_deg)
-                track.speed_mps = _knots_to_mps(ac.get("gs")) if ac.get("gs") else track.speed_mps
-                track.callsign = ac.get("flight", track.callsign)
-                track.last_seen = now
-                track.raw = ac
-
-    # =======================================================================
-    # Remote ID tracks (WiFi + Bluetooth, single-detection updates)
-    # =======================================================================
-    def update_remoteid_track(self, detection: dict):
+    # ------------------------------------------------------------------
+    # Remote ID (WiFi + Bluetooth), merged by basic_id
+    # ------------------------------------------------------------------
+    def update_remoteid(self, source: str, track: dict):
         """
-        Called by WiFiCapture / BluetoothCapture on each parsed Remote ID
-        message. Expected shape (fields optional beyond basic_id):
-          {
-            "source": "wifi" | "bluetooth",
-            "basic_id": str,
-            "lat": float, "lon": float,
-            "alt_m": float, "heading_deg": float, "speed_mps": float,
-            "ua_type": str,
-          }
+        Upsert a single Remote ID observation.
+
+        source: "wifi" or "bluetooth"
+        track: must contain 'track_key' (stable per-session id, e.g. MAC).
+               May contain 'basic_id' once decoded — this is what enables
+               cross-source merging with the other capture module.
         """
-        basic_id = detection.get("basic_id")
-        if not basic_id:
-            LOG.debug("Remote ID detection missing basic_id — dropping: %s", detection)
+        if source not in ("wifi", "bluetooth"):
+            raise ValueError(f"Unknown remote id source: {source!r}")
+
+        track_key = track.get("track_key")
+        if not track_key:
+            LOG.debug("Skipping remote ID track with no track_key: %r", track)
             return
 
-        source_str = detection.get("source", "wifi")
-        try:
-            source = TrackSource(source_str)
-        except ValueError:
-            source = TrackSource.WIFI
-
-        now = time.monotonic()
+        store = self._remoteid_wifi if source == "wifi" else self._remoteid_bt
         with self._lock:
-            track = self._tracks.get(basic_id)
-            if track is None:
-                track = Track(track_id=basic_id, basic_id=basic_id)
-                self._tracks[basic_id] = track
+            entry = dict(track)
+            entry["last_seen"] = _monotonic()
+            store[track_key] = entry
 
-            track.sources.add(source)
-            track.ua_type = detection.get("ua_type", track.ua_type)
-
-            if detection.get("lat") is not None and detection.get("lon") is not None:
-                track.lat = detection["lat"]
-                track.lon = detection["lon"]
-
-            track.alt_m = detection.get("alt_m", track.alt_m)
-            track.heading_deg = detection.get("heading_deg", track.heading_deg)
-            track.speed_mps = detection.get("speed_mps", track.speed_mps)
-            track.last_seen = now
-            track.raw = detection
-
-            # Classify drone confidence based on data completeness
-            if track.has_position() and track.basic_id:
-                track.track_type = TrackType.DRONE_VERIFIED
-            else:
-                track.track_type = TrackType.DRONE_PARTIAL
-
-    # =======================================================================
-    # Pruning
-    # =======================================================================
-    def _prune_stale_tracks(self):
+    # ------------------------------------------------------------------
+    # Zones
+    # ------------------------------------------------------------------
+    def update_zones(self, zones: List[dict]):
+        """Replace the full zone set (called by airspace_manager after
+        each refresh cycle)."""
         with self._lock:
-            to_remove = []
-            for track_id, track in self._tracks.items():
-                timeout = (
-                    self._adsb_stale_after_s
-                    if TrackSource.ADSB in track.sources
-                    else self._remoteid_stale_after_s
-                )
-                if track.age_s() > timeout:
-                    to_remove.append(track_id)
+            self._zones = [dict(z) for z in zones]
 
-            for track_id in to_remove:
-                LOG.debug("Pruning stale track %s (age=%.1fs)",
-                          track_id, self._tracks[track_id].age_s())
-                del self._tracks[track_id]
-
-            if to_remove:
-                LOG.info("Pruned %d stale track(s)", len(to_remove))
-
-    # =======================================================================
-    # Geofence / FRZ zones
-    # =======================================================================
-    def update_geofence_zones(self, zones: list[dict]):
-        """
-        Called by AirspaceManager whenever zones are (re)loaded — e.g.
-        after FRZ regeneration or NOTAM import. Wholesale replace, since
-        zone identity/versioning is AirspaceManager's job, not fusion's.
-
-        Each zone expected to be a GeoJSON Feature-like dict, at minimum:
-          {"geometry": {...}, "properties": {"name": str, "verified": bool, ...}}
-        """
+    def get_zones(self) -> List[dict]:
         with self._lock:
-            self._zones = zones
-            self._zones_updated_at = time.monotonic()
-        LOG.info("Geofence zones updated: %d zone(s)", len(zones))
+            return [dict(z) for z in self._zones]
 
-    def get_zones(self) -> list[dict]:
-        with self._lock:
-            return list(self._zones)
-
-    def zones_age_s(self) -> Optional[float]:
-        with self._lock:
-            if self._zones_updated_at is None:
-                return None
-            return time.monotonic() - self._zones_updated_at
-
-    # =======================================================================
+    # ------------------------------------------------------------------
     # Proximity alerts
-    # =======================================================================
-    def update_proximity_alerts(self, alerts: list[dict]):
+    # ------------------------------------------------------------------
+    def update_proximity_alerts(self, alerts: List[dict]):
+        with self._lock:
+            self._alerts = [dict(a) for a in alerts]
+
+    def get_proximity_alerts(self) -> List[dict]:
+        with self._lock:
+            return [dict(a) for a in self._alerts]
+
+    # ------------------------------------------------------------------
+    # Snapshot for GUI rendering
+    # ------------------------------------------------------------------
+    def get_snapshot(self) -> Dict[str, Any]:
         """
-        Called by ProximityAlertMonitor. Expected shape per alert:
-          {"zone_name": str, "distance_m": float, "verified": False, "zone": {...}}
+        Return a fully merged, position-filtered, icon-resolved view of
+        the world for the GUI's render loop. Tracks without a resolvable
+        lat/lon are excluded entirely (per design decision).
         """
         with self._lock:
-            self._proximity_alerts = alerts
-            self._proximity_updated_at = time.monotonic()
+            adsb_items = list(self._adsb.items())
+            wifi_items = dict(self._remoteid_wifi)
+            bt_items = dict(self._remoteid_bt)
+            zones = [dict(z) for z in self._zones]
+            alerts = [dict(a) for a in self._alerts]
+            gps_fix = dict(self._gps_fix) if self._gps_fix else None
 
-    def get_proximity_alerts(self) -> list[dict]:
-        with self._lock:
-            return list(self._proximity_alerts)
+        tracks: List[dict] = []
 
-    # =======================================================================
-    # GUI-facing snapshot
-    # =======================================================================
-    def get_snapshot(self) -> dict:
-        """
-        Single call for the GUI's render loop — avoids multiple lock
-        acquisitions per frame and pre-resolves icon paths so gui/app.py
-        stays dumb about fusion internals.
+        # --- ADS-B tracks ---
+        for icao, entry in adsb_items:
+            lat, lon = entry.get("lat"), entry.get("lon")
+            if lat is None or lon is None:
+                continue
+            tracks.append({
+                "id": f"adsb:{icao}",
+                "source": "adsb",
+                "lat": lat,
+                "lon": lon,
+                "altitude_m": entry.get("altitude_m"),
+                "heading": entry.get("heading"),
+                "speed_mps": entry.get("speed_mps"),
+                "callsign": entry.get("callsign"),
+                "basic_id": None,
+                "icon": ICON_PLANE,
+            })
 
-        Returns:
-          {
-            "gps_fix": {...} | None,
-            "tracks": [
-              {"id", "lat", "lon", "heading_deg", "icon", "label",
-               "track_type", "sources", "age_s"}, ...
-            ],
-            "zones": [...],
-            "proximity_alerts": [...],
-          }
-        """
-        with self._lock:
-            fix = self.get_gps_fix()  # re-enters lock safely (RLock)
+        # --- Remote ID: merge by basic_id where possible ---
+        merged_basic_ids = set()
+        for entry in list(wifi_items.values()) + list(bt_items.values()):
+            bid = entry.get("basic_id")
+            if bid:
+                merged_basic_ids.add(bid)
 
-            tracks_out = []
-            for track in self._tracks.values():
-                if not track.has_position():
-                    continue  # can't plot without a position
-                tracks_out.append({
-                    "id": track.track_id,
-                    "lat": track.lat,
-                    "lon": track.lon,
-                    "heading_deg": track.heading_deg,
-                    "icon": ICON_MAP.get(track.track_type, ICON_MAP[TrackType.UNKNOWN]),
-                    "label": track.callsign or track.basic_id or track.track_id,
-                    "track_type": track.track_type.value,
-                    "sources": [s.value for s in track.sources],
-                    "age_s": round(track.age_s(), 1),
+        for bid in merged_basic_ids:
+            wifi_entry = next((e for e in wifi_items.values() if e.get("basic_id") == bid), None)
+            bt_entry = next((e for e in bt_items.values() if e.get("basic_id") == bid), None)
+
+            candidates = [e for e in (wifi_entry, bt_entry) if e is not None]
+            primary = max(candidates, key=lambda e: e.get("last_seen", 0))
+
+            lat, lon = primary.get("lat"), primary.get("lon")
+            if lat is None or lon is None:
+                continue  # neither source has a position fix yet for this basic_id
+
+            source_count = sum(1 for e in (wifi_entry, bt_entry) if e is not None)
+            icon = ICON_DRONE_CROSS_VERIFIED if source_count >= 2 else ICON_DRONE_SINGLE_SOURCE
+
+            tracks.append({
+                "id": f"remoteid:{bid}",
+                "source": "remoteid_merged" if source_count >= 2 else (
+                    "remoteid_wifi" if wifi_entry is primary else "remoteid_bt"
+                ),
+                "lat": lat,
+                "lon": lon,
+                "altitude_m": primary.get("altitude_m"),
+                "heading": primary.get("heading"),
+                "speed_mps": primary.get("speed_mps"),
+                "callsign": primary.get("callsign"),
+                "basic_id": bid,
+                "icon": icon,
+            })
+
+        # --- Remote ID: entries with no decoded basic_id (unmerged, unknown identity) ---
+        for source_label, store in (("remoteid_wifi", wifi_items), ("remoteid_bt", bt_items)):
+            for track_key, entry in store.items():
+                if entry.get("basic_id"):
+                    continue  # already handled above via basic_id merge
+                lat, lon = entry.get("lat"), entry.get("lon")
+                if lat is None or lon is None:
+                    continue
+                tracks.append({
+                    "id": f"{source_label}:{track_key}",
+                    "source": source_label,
+                    "lat": lat,
+                    "lon": lon,
+                    "altitude_m": entry.get("altitude_m"),
+                    "heading": entry.get("heading"),
+                    "speed_mps": entry.get("speed_mps"),
+                    "callsign": None,
+                    "basic_id": None,
+                    "icon": ICON_UNKNOWN,
                 })
 
-            return {
-                "gps_fix": fix,
-                "ownship_icon": OWNSHIP_ICON,
-                "tracks": tracks_out,
-                "zones": list(self._zones),
-                "proximity_alerts": list(self._proximity_alerts),
-            }
+        return {
+            "gps": self._decorate_gps(gps_fix),
+            "tracks": tracks,
+            "zones": zones,
+            "alerts": alerts,
+            "counts": {
+                "adsb": len(adsb_items),
+                "remoteid_wifi": len(wifi_items),
+                "remoteid_bt": len(bt_items),
+                "tracks_rendered": len(tracks),
+                "zones": len(zones),
+                "alerts": len(alerts),
+            },
+            "timestamp": _iso_now(),
+        }
 
-    # =======================================================================
-    # Debug / introspection
-    # =======================================================================
-    def track_count(self) -> int:
-        with self._lock:
-            return len(self._tracks)
-
-    def get_track(self, track_id: str) -> Optional[Track]:
-        with self._lock:
-            return self._tracks.get(track_id)
-
-
-# ---------------------------------------------------------------------------
-# Unit helpers (ADS-B feeds use feet / knots)
-# ---------------------------------------------------------------------------
-def _feet_to_m(feet: float) -> float:
-    return feet * 0.3048
+    def _decorate_gps(self, gps_fix: Optional[dict]) -> Optional[dict]:
+        if gps_fix is None:
+            return None
+        age_s = _monotonic() - gps_fix["last_seen"]
+        gps_fix["age_s"] = age_s
+        gps_fix["stale"] = age_s > self._timeouts["gps"]
+        return gps_fix
 
 
-def _knots_to_mps(knots: float) -> float:
-    return knots * 0.514444
+# ----------------------------------------------------------------------
+# Standalone smoke test
+# ----------------------------------------------------------------------
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.DEBUG)
+    f = Fusion(timeouts={"adsb": 2, "remoteid": 2, "gps": 2}, prune_interval_s=1)
+    f.start()
+
+    f.update_gps_fix(51.5, -0.1)
+    f.update_adsb_tracks([{"icao": "4CA123", "lat": 51.51, "lon": -0.09, "callsign": "BAW123"}])
+    f.update_remoteid("wifi", {"track_key": "AA:BB:CC:DD:EE:FF", "basic_id": "DRONE123",
+                                "lat": 51.505, "lon": -0.11})
+    f.update_remoteid("bluetooth", {"track_key": "FF:11:22", "basic_id": "DRONE123",
+                                     "lat": 51.5051, "lon": -0.1101})
+    f.update_remoteid("wifi", {"track_key": "11:22:33", "lat": 51.52, "lon": -0.12})  # no basic_id
+
+    snap = f.get_snapshot()
+    print("Tracks:")
+    for t in snap["tracks"]:
+        print(f"  {t['id']:<30} icon={t['icon']} source={t['source']}")
+
+    print("Waiting for prune...")
+    time.sleep(3)
+    snap = f.get_snapshot()
+    print("Tracks after prune:", len(snap["tracks"]))
+    f.stop()
