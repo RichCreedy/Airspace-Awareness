@@ -1,0 +1,49 @@
+gps:
+  device: /dev/ttyAMA0
+  baud: 9600
+  use_gpsd: true
+
+adsb:
+  endpoint: "http://localhost/data/aircraft.json"
+  poll_interval_sec: 2
+
+wifi:
+  interface: "wlan0mon"   # TODO: set to your monitor-mode iface
+  channel_hop: [1, 6, 11]
+
+bluetooth:
+  scan_timeout_sec: 5
+  service_uuid: "0000fffa-0000-1000-8000-00805f9b34fb"
+
+tiles:
+  mode: hybrid            # online | offline | hybrid
+  cache_dir: data/tiles
+  online_check_url: "https://tile.openstreetmap.org/0/0/0.png"
+  seed_radius_km: 25
+  tile_server_url: "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+
+airspace:
+  geofence_path: data/geofences/uk_zones.geojson
+  notam_dir: data/notam
+  auto_refresh:
+    enabled: true
+    interval_min: 60
+    backoff_max_min: 240
+  proximity_alert:
+    enabled: true
+    radius_km: 5
+    check_interval_sec: 15
+  openaip:
+    api_key: "e4c323fcf6475153b43adca8a46300ef"            # TODO: fill in if using OpenAIP
+    endpoint: "https://api.core.openaip.net/api/airspaces"
+
+disclaimer:
+  show_on_start: true
+  flag_file: "data/.disclaimer_dismissed"
+
+fusion:
+  stale_timeout_sec: 30
+
+logging:
+  level: INFO
+  file: airspace.log
