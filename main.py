@@ -32,6 +32,17 @@ from modules.wifi_capture import WiFiCapture
 from modules.bluetooth_capture import BluetoothCapture
 from modules.airspace_manager import AirspaceManager
 from modules.proximity_alert_monitor import ProximityAlertMonitor
+from unverified_zone_banner import UnverifiedZoneBanner
+
+# after orchestrator + config are loaded:
+banner = UnverifiedZoneBanner(orchestrator, config=config)
+root_layout.add_widget(top_bar)
+root_layout.add_widget(banner)     # between top bar and map
+root_layout.add_widget(mapview)
+banner.start()
+
+# on app stop:
+banner.stop()
 
 LOG = logging.getLogger("main")
 
