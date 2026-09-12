@@ -1,52 +1,35 @@
 """
-modules/openaip_sync.py — Remote airspace data sync via openAIP.net
+modules/openaip_sync.py — Optional remote sync from OpenAIP
 
-Called by modules/airspace_manager.py as:
-    openaip_sync.fetch_zones(config) -> List[zone_dict]
+Contract expected by modules/airspace_manager.py:
+    fetch_zones(config: dict) -> List[dict]
 
-Only invoked when config["remote_sync"]["openaip_enabled"] is True.
-
-ASSUMPTIONS (flagged — confirm against your actual openAIP account):
-    - Uses openAIP's public REST API: https://api.core.openaip.net/api
-      with a Bearer API key (config["openaip"]["api_key"]).
-    - Filters by country=GB by default; optionally further filters to
-      a bounding box around a "home" lat/lon + radius, to keep payload
-      size sane for a low-power uConsole.
-    - openAIP airspace polygons are curated/official data, so these
-      zones default to verified=True (unlike our own generated FRZs
-      or regex-decoded NOTAMs).
-    - openAIP GeoJSON coordinates are [lon, lat] — converted here to
-      our internal (lat, lon) convention.
-    - Implements simple pagination (openAIP uses `page`/`limit` or
-      `offset`/`limit` depending on API version — this uses
-      limit/offset, adjust if your API version differs).
-    - Implements disk caching (data/cache/openaip_zones.json) with a
-      configurable TTL, independent of airspace_manager's own refresh
-      interval — avoids hammering the API on every manager refresh
-      cycle if that interval is short.
-    - On any failure (network, auth, rate limit), falls back to the
-      on-disk cache — same hybrid-offline philosophy as map tiles.
-
-Config contract (config["openaip"], all optional except api_key):
+Returned zone dicts MUST match the shape defined in airspace_manager.py:
     {
-        "api_key": None,                       # REQUIRED
-        "base_url": "https://api.core.openaip.net/api",
-        "country": "GB",
-        "home_lat": None,                      # optional bbox centre
-        "home_lon": None,
-        "bbox_radius_km": 150,                 # only used if home_lat/lon set
-        "page_limit": 100,
-        "timeout_s": 15,
-        "cache_path": "data/cache/openaip_zones.json",
-        "cache_ttl_s": 86400,                  # 24h — openAIP data changes rarely
+        "id": str, "name": str, "type": str,
+        "polygon": [(lat, lon), ...],
+        "verified": bool, "expiry": str|None, "source": str
     }
+(airspace_manager overwrites "source" itself, so it doesn't matter much
+what we put there, but we set something sensible anyway.)
+
+This module is OPTIONAL — if `requests` isn't installed, or the API
+key isn't configured, fetch_zones() raises a clear exception which
+airspace_manager.py logs and continues past.
+
+Config expected under config["remote_sync"], plus top-level:
+    remote_sync:
+      openaip_enabled: true
+      openaip_api_key: "..."
+      openaip_bbox: [lat_min, lon_min, lat_max, lon_max]   # optional
+      openaip_cache_path: "data/cache/openaip_zones.json"
+      openaip_cache_ttl_s: 86400
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import math
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -54,216 +37,130 @@ from typing import Any, Dict, List, Optional
 LOG = logging.getLogger("modules.openaip_sync")
 
 try:
-    import requests
+    import requests  # type: ignore
 except ImportError:
-    requests = None
+    requests = None  # noqa: N816
 
-DEFAULT_CONFIG: Dict[str, Any] = {
-    "api_key": None,
-    "base_url": "https://api.core.openaip.net/api",
-    "country": "GB",
-    "home_lat": None,
-    "home_lon": None,
-    "bbox_radius_km": 150,
-    "page_limit": 100,
-    "timeout_s": 15,
-    "cache_path": "data/cache/openaip_zones.json",
-    "cache_ttl_s": 86400,
-}
+OPENAIP_API_BASE = "https://api.openaip.net/api"
 
-# openAIP "type" integer codes are numeric in their API; we map a subset
-# to human-readable strings for our GUI. Extend as needed.
-_TYPE_MAP = {
-    0: "Other",
-    1: "Restricted",
-    2: "Danger",
-    3: "Prohibited",
-    4: "CTR",
-    5: "TMA",
-    6: "TMZ",
-    7: "TIZ",
-    26: "FRZ",  # not an official openAIP code — placeholder, verify
+# OpenAIP airspace "type" codes we care about, mapped to our internal
+# zone "type" field. Extend as needed — anything not in this map is
+# skipped (we don't want to flood the map with every ATZ/TMZ variant
+# until they've been reviewed).
+TYPE_MAP: Dict[int, str] = {
+    1: "Restricted",   # Restricted Area
+    2: "Danger",        # Danger Area
+    5: "Prohibited",    # Prohibited Area
+    9: "TMZ",
+    14: "RMZ",
 }
 
 
-def _km_to_deg_lat(km: float) -> float:
-    return km / 111.32  # approx km per degree latitude
+class OpenAIPError(RuntimeError):
+    pass
 
 
-def _bbox_from_home(lat: float, lon: float, radius_km: float):
-    dlat = _km_to_deg_lat(radius_km)
-    dlon = radius_km / (111.32 * max(math.cos(math.radians(lat)), 0.01))
-    return {
-        "min_lat": lat - dlat, "max_lat": lat + dlat,
-        "min_lon": lon - dlon, "max_lon": lon + dlon,
-    }
+def _cache_path(config: Dict[str, Any]) -> Path:
+    remote_cfg = config.get("remote_sync", {})
+    return Path(remote_cfg.get("openaip_cache_path", "data/cache/openaip_zones.json"))
 
 
-def _polygon_from_geojson(geometry: dict) -> Optional[List[tuple]]:
-    if not geometry or geometry.get("type") != "Polygon":
+def _load_cache(config: Dict[str, Any]) -> Optional[List[dict]]:
+    path = _cache_path(config)
+    if not path.exists():
         return None
-    coords = geometry.get("coordinates")
+    remote_cfg = config.get("remote_sync", {})
+    ttl_s = float(remote_cfg.get("openaip_cache_ttl_s", 86400))
+    age_s = time.time() - path.stat().st_mtime
+    if age_s > ttl_s:
+        LOG.info("openaip cache expired (%.0fs old, ttl=%.0fs)", age_s, ttl_s)
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        LOG.warning("openaip cache unreadable, ignoring: %s", exc)
+        return None
+
+
+def _save_cache(config: Dict[str, Any], zones: List[dict]):
+    path = _cache_path(config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(zones))
+
+
+def _polygon_from_openaip_geometry(geometry: dict) -> Optional[List[tuple]]:
+    """
+    OpenAIP airspace geometry is GeoJSON Polygon, [lon, lat] pairs,
+    same convention as our other GeoJSON sources.
+    """
+    coords = (geometry or {}).get("coordinates")
     if not coords:
         return None
     exterior = coords[0]
     try:
-        return [(pt[1], pt[0]) for pt in exterior]  # [lon,lat] -> (lat,lon)
+        return [(pt[1], pt[0]) for pt in exterior]
     except (IndexError, TypeError):
         return None
 
 
-def _load_cache(cache_path: Path) -> Optional[List[dict]]:
-    if not cache_path.exists():
-        return None
-    try:
-        payload = json.loads(cache_path.read_text())
-        return payload.get("zones")
-    except (OSError, json.JSONDecodeError):
-        LOG.exception("openaip_sync: failed to read cache file %s", cache_path)
-        return None
-
-
-def _cache_is_fresh(cache_path: Path, ttl_s: float) -> bool:
-    if not cache_path.exists():
-        return False
-    age_s = time.time() - cache_path.stat().st_mtime
-    return age_s < ttl_s
-
-
-def _save_cache(cache_path: Path, zones: List[dict]):
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    cache_path.write_text(json.dumps({"zones": zones, "cached_at": time.time()}))
-
-
-def _fetch_page(cfg: dict, offset: int) -> dict:
-    url = f"{cfg['base_url']}/airspaces"
-    params = {
-        "country": cfg["country"],
-        "limit": cfg["page_limit"],
-        "offset": offset,
-    }
-    if cfg.get("home_lat") is not None and cfg.get("home_lon") is not None:
-        bbox = _bbox_from_home(cfg["home_lat"], cfg["home_lon"], cfg["bbox_radius_km"])
-        params["bbox"] = f"{bbox['min_lon']},{bbox['min_lat']},{bbox['max_lon']},{bbox['max_lat']}"
-
-    headers = {"x-openaip-api-key": cfg["api_key"]}
-    resp = requests.get(url, params=params, headers=headers, timeout=cfg["timeout_s"])
-    resp.raise_for_status()
-    return resp.json()
-
-
-def _fetch_all_pages(cfg: dict) -> List[dict]:
-    items: List[dict] = []
-    offset = 0
-    while True:
-        payload = _fetch_page(cfg, offset)
-        page_items = payload.get("items", payload if isinstance(payload, list) else [])
-        if not page_items:
-            break
-        items.extend(page_items)
-        if len(page_items) < cfg["page_limit"]:
-            break
-        offset += cfg["page_limit"]
-        if offset > 5000:  # safety valve against runaway pagination
-            LOG.warning("openaip_sync: pagination safety limit reached — stopping early")
-            break
-    return items
-
-
-def _normalise_airspace(item: dict) -> Optional[dict]:
-    geometry = item.get("geometry")
-    polygon = _polygon_from_geojson(geometry)
-    if not polygon:
-        return None
-
-    type_code = item.get("type")
-    type_str = _TYPE_MAP.get(type_code, item.get("icaoClass", "Airspace"))
-
-    name = item.get("name", "Unnamed Airspace")
-    zone_id = f"openaip:{item.get('_id', name)}"
-
-    return {
-        "id": zone_id,
-        "name": name,
-        "type": type_str,
-        "polygon": polygon,
-        "verified": True,   # curated openAIP data — treated as authoritative
-        "expiry": None,     # permanent airspace, not time-limited
-        "source": "openaip",
-    }
-
-
-def fetch_zones(config: dict) -> List[dict]:
+def fetch_zones(config: Dict[str, Any]) -> List[dict]:
     """
-    Public entry point called by airspace_manager. Returns a list of
-    zone dicts. Uses a local disk cache (TTL-based) to avoid hammering
-    the openAIP API on every airspace_manager refresh cycle, and falls
-    back to that cache entirely if the live fetch fails.
+    Fetch airspace zones from OpenAIP, falling back to on-disk cache
+    on network failure. Raises OpenAIPError if there's no usable data
+    at all (no network AND no cache) — airspace_manager.py catches
+    this and logs it, leaving previously-loaded zones untouched.
     """
-    cfg = dict(DEFAULT_CONFIG)
-    cfg.update((config or {}).get("openaip", {}))
-    cache_path = Path(cfg["cache_path"])
-
-    if _cache_is_fresh(cache_path, cfg["cache_ttl_s"]):
-        cached = _load_cache(cache_path)
-        if cached is not None:
-            LOG.debug("openaip_sync: using fresh cache (%d zones)", len(cached))
-            return cached
-
-    if not cfg.get("api_key"):
-        LOG.warning("openaip_sync: no api_key configured — falling back to cache (if any)")
-        return _load_cache(cache_path) or []
+    remote_cfg = config.get("remote_sync", {})
+    api_key = remote_cfg.get("openaip_api_key")
 
     if requests is None:
-        LOG.warning("openaip_sync: 'requests' package not installed — falling back to cache")
-        return _load_cache(cache_path) or []
+        raise OpenAIPError("requests library not installed")
+    if not api_key:
+        raise OpenAIPError("remote_sync.openaip_api_key not configured")
+
+    params: Dict[str, Any] = {"apiKey": api_key, "limit": 1000}
+    bbox = remote_cfg.get("openaip_bbox")
+    if bbox and len(bbox) == 4:
+        lat_min, lon_min, lat_max, lon_max = bbox
+        params["bbox"] = f"{lon_min},{lat_min},{lon_max},{lat_max}"
 
     try:
-        raw_items = _fetch_all_pages(cfg)
+        resp = requests.get(
+            f"{OPENAIP_API_BASE}/airspaces", params=params, timeout=15
+        )
+        resp.raise_for_status()
+        payload = resp.json()
     except Exception as exc:
-        LOG.warning("openaip_sync: live fetch failed (%s) — falling back to cache", exc)
-        return _load_cache(cache_path) or []
+        LOG.warning("OpenAIP fetch failed (%s) — trying cache", exc)
+        cached = _load_cache(config)
+        if cached is not None:
+            return cached
+        raise OpenAIPError(f"OpenAIP fetch failed and no usable cache: {exc}") from exc
 
     zones: List[dict] = []
-    for item in raw_items:
-        try:
-            zone = _normalise_airspace(item)
-        except Exception:
-            LOG.exception("openaip_sync: failed to normalise airspace item %r",
-                          item.get("_id", "?"))
-            zone = None
-        if zone:
-            zones.append(zone)
+    for item in payload.get("items", payload) if isinstance(payload, dict) else payload:
+        type_code = item.get("type")
+        zone_type = TYPE_MAP.get(type_code)
+        if zone_type is None:
+            continue  # not a type we display
 
-    LOG.info("openaip_sync: fetched %d raw item(s), normalised %d zone(s)",
-              len(raw_items), len(zones))
+        polygon = _polygon_from_openaip_geometry(item.get("geometry"))
+        if not polygon:
+            continue
 
-    if zones:
-        _save_cache(cache_path, zones)
-    else:
-        LOG.warning("openaip_sync: fetch succeeded but produced 0 usable zones — "
-                    "keeping previous cache untouched")
+        zid = f"openaip:{item.get('_id', item.get('name', 'unknown'))}"
+        zones.append({
+            "id": zid,
+            "name": item.get("name", "Unnamed Airspace"),
+            "type": zone_type,
+            "polygon": polygon,
+            "verified": True,   # OpenAIP data treated as authoritative/verified
+            "expiry": None,     # OpenAIP airspaces are permanent, not NOTAM-style
+            "source": "openaip",
+        })
 
+    if not zones:
+        LOG.warning("OpenAIP returned 0 usable zones for configured bbox/filters")
+
+    _save_cache(config, zones)
     return zones
-
-
-# ----------------------------------------------------------------------
-# Standalone smoke test (no network required — synthetic GeoJSON item)
-# ----------------------------------------------------------------------
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.DEBUG)
-
-    sample_item = {
-        "_id": "abc123",
-        "name": "LONDON CTR",
-        "type": 4,
-        "icaoClass": "D",
-        "geometry": {
-            "type": "Polygon",
-            "coordinates": [[
-                [-0.5, 51.4], [-0.4, 51.4], [-0.4, 51.5], [-0.5, 51.5], [-0.5, 51.4]
-            ]]
-        },
-    }
-    zone = _normalise_airspace(sample_item)
-    print("Normalised zone:", zone)
