@@ -1,0 +1,32 @@
+# --- Core GUI ---------------------------------------------------------
+kivy==2.3.0
+kivy_garden.mapview==1.0.6
+
+# --- Detection / Parsing -----------------------------------------------
+scapy==2.5.0             # Passive WiFi sniffing + Remote ID IE parsing
+bleak==0.21.1            # Bluetooth LE scanning (Remote ID Service Data)
+
+# --- Networking / Data ---------------------------------------------------
+requests==2.31.0         # ADS-B polling, NOTAM/openAIP fetch
+PyYAML==6.0.1            # config.yaml parsing
+
+# --- Geospatial ---------------------------------------------------------
+shapely==2.0.4           # Point-in-polygon, proximity distance calcs
+geojson==3.1.0           # Geofence zone loading/validation
+
+# --- Imaging (map tiles, marker icons) -----------------------------------
+Pillow==10.3.0
+
+# --- Testing --------------------------------------------------------------
+pytest==8.2.0
+pytest-mock==3.14.0
+
+# --- Optional / hardware-dependent (install via system package manager) --
+# python3-gps         -> apt install python3-gps  (NOT pip-installable;
+#                         provides gpsd Python bindings for GPS reader)
+# pyrtlsdr            -> only needed if bypassing tar1090/readsb and
+#                         talking to the RTL-SDR directly (uncomment if used)
+# pyrtlsdr==0.2.93
+
+# --- Optional: systemd journal logging on the uConsole -------------------
+# systemd-python==235   # uncomment if logging to journalctl is desired
