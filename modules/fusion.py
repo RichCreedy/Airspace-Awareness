@@ -295,9 +295,11 @@ class Fusion:
             if bid:
                 merged_basic_ids.add(bid)
 
-        for bid in merged_basic_ids:
-            wifi_entry = next((e for e in wifi_items.values() if e.get("basic_id") == bid), None)
-            bt_entry = next((e for e in bt_items.values() if e.get("basic_id") == bid), None)
+       for bid in merged_basic_ids:
+            wifi_candidates = [e for e in wifi_items.values() if e.get("basic_id") == bid]
+            bt_candidates = [e for e in bt_items.values() if e.get("basic_id") == bid]
+            wifi_entry = max(wifi_candidates, key=lambda e: e.get("last_seen", 0), default=None)
+            bt_entry = max(bt_candidates, key=lambda e: e.get("last_seen", 0), default=None)
 
             candidates = [e for e in (wifi_entry, bt_entry) if e is not None]
             primary = max(candidates, key=lambda e: e.get("last_seen", 0))
