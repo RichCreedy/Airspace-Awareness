@@ -1,278 +1,162 @@
 """
-modules/notam_import.py — Automated NOTAM fetch & parse (pluggable)
+modules/notam_import.py — Optional remote NOTAM sync
 
-Called by modules/airspace_manager.py as:
-    notam_import.fetch_notams(config) -> List[zone_dict]
+Contract expected by modules/airspace_manager.py:
+    fetch_notams(config: dict) -> List[dict]
 
-Only invoked when config["remote_sync"]["notam_enabled"] is True.
+Same zone dict shape as openaip_sync.fetch_zones(). NOTAMs are
+typically short-lived, so unlike OpenAIP data they usually carry a
+real `expiry` — airspace_manager.py's _prune_expired() will drop them
+automatically once expired.
 
-ASSUMPTIONS (flagged — no confirmed live UK NOTAM API was specified):
-    - This module supports TWO input formats from the configured URL:
+This module targets a generic NOTAM JSON feed (e.g. a self-hosted
+proxy in front of the UK NOTAM API, or a third-party aggregator) since
+there's no single free/open UK NOTAM API with a stable contract. The
+expected feed shape is configurable via `notam_feed_url`, returning:
 
-      (A) "Pre-formatted" feed — a JSON array already matching our
-          internal zone schema (id/name/type/polygon/verified/expiry).
-          This is the easy path if a future upstream (CAA, NATS,
-          openAIP NOTAM bridge, etc.) is adapted to emit this directly.
-
-      (B) "Simple circular NOTAM" feed — a JSON array of raw NOTAM-like
-          records with free-text fields, e.g.:
-              {
-                "id": "A1234/25",
-                "text": "AERIAL DISPLAY APRX 2NM RADIUS CENTRE 513026N 0002743W",
-                "valid_from": "2025-06-01T00:00:00Z",
-                "valid_till": "2025-06-01T18:00:00Z"
-              }
-          We regex-decode the DMS coordinate + radius out of the free
-          text. This is inherently approximate, so these zones are
-          ALWAYS marked verified=False (same rationale as generated
-          FRZs — surfaces the "⚠️ Approximate" label in the GUI).
-
-    - Format is auto-detected per-record: if a record already has a
-      'polygon' key, treated as (A); otherwise (B) is attempted.
-    - If neither the network fetch nor decode succeeds, falls back to
-      the last successfully cached file on disk (data/cache/notams.json
-      by default) so the app keeps running with slightly stale data
-      rather than zero NOTAMs.
-
-Config contract (config["notam"], all optional with defaults below):
     {
-        "url": None,                       # REQUIRED to actually fetch
-        "cache_path": "data/cache/notams.json",
-        "timeout_s": 10,
-        "default_radius_m": 3704,          # 2NM fallback if radius unparsable
-        "default_validity_hours": 24,      # if valid_till missing
+      "notams": [
+        {
+          "id": "A1234/24",
+          "name": "TEMP DANGER AREA",
+          "category": "danger" | "restricted" | "warning" | ...,
+          "validFrom": "2024-06-01T00:00:00Z",
+          "validTo": "2024-06-10T23:59:00Z",
+          "geometry": {"type": "Polygon", "coordinates": [[[lon,lat],...]]}
+        },
+        ...
+      ]
     }
+
+Config expected under config["remote_sync"]:
+    remote_sync:
+      notam_enabled: true
+      notam_feed_url: "https://example.org/notams/uk.json"
+      notam_feed_api_key: "..."          # optional, sent as Bearer token
+      notam_cache_path: "data/cache/notam_zones.json"
+      notam_cache_ttl_s: 3600
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import math
-import re
-from datetime import datetime, timedelta, timezone
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 LOG = logging.getLogger("modules.notam_import")
 
 try:
-    import requests
+    import requests  # type: ignore
 except ImportError:
-    requests = None  # network fetch disabled if requests isn't installed
+    requests = None  # noqa: N816
 
-DEFAULT_CONFIG: Dict[str, Any] = {
-    "url": None,
-    "cache_path": "data/cache/notams.json",
-    "timeout_s": 10,
-    "default_radius_m": 3704,          # ~2 NM
-    "default_validity_hours": 24,
+CATEGORY_MAP: Dict[str, str] = {
+    "danger": "Danger",
+    "restricted": "Restricted",
+    "warning": "NOTAM",
+    "prohibited": "Prohibited",
 }
 
-EARTH_RADIUS_M = 6371000
 
-# DMS coordinate pattern, e.g. "513026N 0002743W"
-_COORD_RE = re.compile(
-    r"(?P<lat_deg>\d{2})(?P<lat_min>\d{2})(?P<lat_sec>\d{2})(?P<lat_hem>[NS])\s*"
-    r"(?P<lon_deg>\d{3})(?P<lon_min>\d{2})(?P<lon_sec>\d{2})(?P<lon_hem>[EW])"
-)
-
-# Radius pattern, e.g. "2NM RADIUS", "3.5 KM RADIUS", "500M RADIUS"
-_RADIUS_RE = re.compile(
-    r"(?P<value>\d+(\.\d+)?)\s*(?P<unit>NM|KM|M)\s*RADIUS",
-    re.IGNORECASE,
-)
-
-_UNIT_TO_METRES = {"NM": 1852.0, "KM": 1000.0, "M": 1.0}
+class NotamImportError(RuntimeError):
+    pass
 
 
-def _dms_to_decimal(deg: str, minute: str, sec: str, hemisphere: str) -> float:
-    value = int(deg) + int(minute) / 60.0 + int(sec) / 3600.0
-    if hemisphere in ("S", "W"):
-        value = -value
-    return value
+def _cache_path(config: Dict[str, Any]) -> Path:
+    remote_cfg = config.get("remote_sync", {})
+    return Path(remote_cfg.get("notam_cache_path", "data/cache/notam_zones.json"))
 
 
-def _circle_polygon(lat: float, lon: float, radius_m: float, num_points: int = 24):
-    points = []
-    for i in range(num_points):
-        bearing = math.radians((360.0 / num_points) * i)
-        ang_dist = radius_m / EARTH_RADIUS_M
-        lat1, lon1 = math.radians(lat), math.radians(lon)
-        lat2 = math.asin(math.sin(lat1) * math.cos(ang_dist)
-                          + math.cos(lat1) * math.sin(ang_dist) * math.cos(bearing))
-        lon2 = lon1 + math.atan2(
-            math.sin(bearing) * math.sin(ang_dist) * math.cos(lat1),
-            math.cos(ang_dist) - math.sin(lat1) * math.sin(lat2),
-        )
-        points.append((math.degrees(lat2), math.degrees(lon2)))
-    return points
-
-
-def _parse_circular_notam(record: dict, cfg: dict) -> Optional[dict]:
-    text = record.get("text", "")
-    coord_match = _COORD_RE.search(text)
-    if not coord_match:
-        LOG.debug("NOTAM %s: no decodable coordinate in text — skipping",
-                  record.get("id", "?"))
+def _load_cache(config: Dict[str, Any]) -> Optional[List[dict]]:
+    path = _cache_path(config)
+    if not path.exists():
+        return None
+    remote_cfg = config.get("remote_sync", {})
+    ttl_s = float(remote_cfg.get("notam_cache_ttl_s", 3600))
+    age_s = time.time() - path.stat().st_mtime
+    if age_s > ttl_s:
+        LOG.info("notam cache expired (%.0fs old, ttl=%.0fs)", age_s, ttl_s)
+        return None
+    try:
+        return json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError) as exc:
+        LOG.warning("notam cache unreadable, ignoring: %s", exc)
         return None
 
-    lat = _dms_to_decimal(coord_match["lat_deg"], coord_match["lat_min"],
-                           coord_match["lat_sec"], coord_match["lat_hem"])
-    lon = _dms_to_decimal(coord_match["lon_deg"], coord_match["lon_min"],
-                           coord_match["lon_sec"], coord_match["lon_hem"])
 
-    radius_match = _RADIUS_RE.search(text)
-    if radius_match:
-        value = float(radius_match["value"])
-        unit = radius_match["unit"].upper()
-        radius_m = value * _UNIT_TO_METRES[unit]
-    else:
-        radius_m = cfg["default_radius_m"]
-        LOG.debug("NOTAM %s: no radius found in text, defaulting to %.0fm",
-                  record.get("id", "?"), radius_m)
-
-    valid_till = record.get("valid_till")
-    if not valid_till:
-        valid_till = (datetime.now(timezone.utc)
-                      + timedelta(hours=cfg["default_validity_hours"])).isoformat()
-        LOG.debug("NOTAM %s: no valid_till given, defaulting to +%dh",
-                  record.get("id", "?"), cfg["default_validity_hours"])
-
-    notam_id = record.get("id", f"notam:{lat:.4f},{lon:.4f}")
-    return {
-        "id": f"notam:{notam_id}",
-        "name": record.get("id", "NOTAM"),
-        "type": "NOTAM",
-        "polygon": _circle_polygon(lat, lon, radius_m),
-        "verified": False,   # regex-decoded circle is always approximate
-        "expiry": valid_till,
-        "source": "notam_import",
-    }
+def _save_cache(config: Dict[str, Any], zones: List[dict]):
+    path = _cache_path(config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(zones))
 
 
-def _normalise_preformatted(record: dict) -> Optional[dict]:
-    polygon = record.get("polygon")
-    if not polygon or len(polygon) < 3:
-        LOG.warning("Pre-formatted NOTAM record %s has invalid polygon — skipping",
-                    record.get("id", "?"))
+def _polygon_from_notam_geometry(geometry: dict) -> Optional[List[tuple]]:
+    coords = (geometry or {}).get("coordinates")
+    if not coords:
         return None
-    return {
-        "id": f"notam:{record.get('id', record.get('name', 'unknown'))}",
-        "name": record.get("name", record.get("id", "NOTAM")),
-        "type": record.get("type", "NOTAM"),
-        "polygon": [tuple(pt) for pt in polygon],
-        "verified": bool(record.get("verified", False)),
-        "expiry": record.get("expiry"),
-        "source": "notam_import",
-    }
+    exterior = coords[0]
+    try:
+        return [(pt[1], pt[0]) for pt in exterior]
+    except (IndexError, TypeError):
+        return None
 
 
-def _fetch_raw(cfg: dict) -> List[dict]:
-    if not cfg.get("url"):
-        raise RuntimeError("notam_import: config['notam']['url'] not set — nothing to fetch")
+def fetch_notams(config: Dict[str, Any]) -> List[dict]:
+    """
+    Fetch NOTAM-derived zones from the configured feed, falling back
+    to cache on failure. Raises NotamImportError if nothing usable is
+    available — airspace_manager.py logs and continues past.
+    """
+    remote_cfg = config.get("remote_sync", {})
+    feed_url = remote_cfg.get("notam_feed_url")
+
     if requests is None:
-        raise RuntimeError("notam_import: 'requests' package not installed")
+        raise NotamImportError("requests library not installed")
+    if not feed_url:
+        raise NotamImportError("remote_sync.notam_feed_url not configured")
 
-    resp = requests.get(cfg["url"], timeout=cfg["timeout_s"])
-    resp.raise_for_status()
-    data = resp.json()
-    if isinstance(data, dict) and "notams" in data:
-        data = data["notams"]
-    if not isinstance(data, list):
-        raise RuntimeError("notam_import: expected a JSON list (or {'notams': [...]})")
-    return data
-
-
-def _load_cache(cache_path: Path) -> List[dict]:
-    if not cache_path.exists():
-        LOG.warning("notam_import: no cache file at %s — returning empty NOTAM list", cache_path)
-        return []
-    try:
-        return json.loads(cache_path.read_text())
-    except (OSError, json.JSONDecodeError):
-        LOG.exception("notam_import: failed to read cache file %s", cache_path)
-        return []
-
-
-def _save_cache(cache_path: Path, zones: List[dict]):
-    cache_path.parent.mkdir(parents=True, exist_ok=True)
-    cache_path.write_text(json.dumps(zones))
-
-
-def fetch_notams(config: dict) -> List[dict]:
-    """
-    Public entry point called by airspace_manager. Returns a list of
-    zone dicts (matching the schema used throughout the app). Falls
-    back to the on-disk cache if the live fetch fails.
-    """
-    cfg = dict(DEFAULT_CONFIG)
-    cfg.update((config or {}).get("notam", {}))
-    cache_path = Path(cfg["cache_path"])
+    headers = {}
+    api_key = remote_cfg.get("notam_feed_api_key")
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
 
     try:
-        raw_records = _fetch_raw(cfg)
+        resp = requests.get(feed_url, headers=headers, timeout=15)
+        resp.raise_for_status()
+        payload = resp.json()
     except Exception as exc:
-        LOG.warning("notam_import: live fetch failed (%s) — falling back to cache", exc)
-        return _load_cache(cache_path)
+        LOG.warning("NOTAM feed fetch failed (%s) — trying cache", exc)
+        cached = _load_cache(config)
+        if cached is not None:
+            return cached
+        raise NotamImportError(f"NOTAM fetch failed and no usable cache: {exc}") from exc
 
     zones: List[dict] = []
-    for record in raw_records:
-        try:
-            if "polygon" in record:
-                zone = _normalise_preformatted(record)
-            else:
-                zone = _parse_circular_notam(record, cfg)
-        except Exception:
-            LOG.exception("notam_import: failed to parse record %s — skipping",
-                          record.get("id", "?"))
-            zone = None
+    for item in payload.get("notams", []):
+        polygon = _polygon_from_notam_geometry(item.get("geometry"))
+        if not polygon:
+            LOG.debug("Skipping NOTAM %s — no usable geometry (text-only NOTAM?)",
+                      item.get("id"))
+            continue
 
-        if zone:
-            zones.append(zone)
+        category = (item.get("category") or "").lower()
+        zone_type = CATEGORY_MAP.get(category, "NOTAM")
 
-    LOG.info("notam_import: fetched and parsed %d/%d NOTAM record(s)",
-              len(zones), len(raw_records))
+        zid = f"notam:{item.get('id', 'unknown')}"
+        zones.append({
+            "id": zid,
+            "name": item.get("name", item.get("id", "NOTAM")),
+            "type": zone_type,
+            "polygon": polygon,
+            "verified": True,          # feed-sourced NOTAMs treated as verified
+            "expiry": item.get("validTo"),
+            "source": "notam_remote",
+        })
 
-    if zones:
-        _save_cache(cache_path, zones)
-    else:
-        LOG.warning("notam_import: fetch succeeded but produced 0 usable zones — "
-                    "keeping previous cache untouched")
+    if not zones:
+        LOG.info("NOTAM feed returned 0 zones with usable geometry")
 
+    _save_cache(config, zones)
     return zones
-
-
-# ----------------------------------------------------------------------
-# Standalone smoke test (no network required — uses a synthetic record)
-# ----------------------------------------------------------------------
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.DEBUG)
-
-    sample_records = [
-        {
-            "id": "A1234/25",
-            "text": "AERIAL DISPLAY APRX 2NM RADIUS CENTRE 513026N 0002743W",
-            "valid_from": "2025-06-01T00:00:00Z",
-            "valid_till": "2025-06-01T18:00:00Z",
-        },
-        {
-            "id": "PREFAB-1",
-            "name": "Pre-formatted Test Zone",
-            "type": "NOTAM",
-            "polygon": [[51.5, -0.1], [51.51, -0.1], [51.51, -0.09], [51.5, -0.09]],
-            "verified": True,
-            "expiry": None,
-        },
-    ]
-
-    cfg_stub = {"notam": {"default_radius_m": 3704, "default_validity_hours": 24}}
-    parsed = []
-    for rec in sample_records:
-        z = _normalise_preformatted(rec) if "polygon" in rec else _parse_circular_notam(rec, {**DEFAULT_CONFIG, **cfg_stub["notam"]})
-        if z:
-            parsed.append(z)
-
-    print(f"Parsed {len(parsed)} zone(s):")
-    for z in parsed:
-        print(f"  - {z['name']} verified={z['verified']} points={len(z['polygon'])}")
