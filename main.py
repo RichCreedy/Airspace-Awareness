@@ -35,10 +35,12 @@ from modules.proximity_alert_monitor import ProximityAlertMonitor
 from unverified_zone_banner import UnverifiedZoneBanner
 
 # after orchestrator + config are loaded:
-banner = UnverifiedZoneBanner(orchestrator, config=config)
-root_layout.add_widget(top_bar)
-root_layout.add_widget(banner)     # between top bar and map
-root_layout.add_widget(mapview)
+proximity_cfg = config.get("airspace", {}).get("proximity_alert", {})
+banner = UnverifiedZoneBanner(fusion=fusion, config=proximity_cfg)
+
+top_level_layout.add_widget(top_bar)
+top_level_layout.add_widget(banner)      # 👈 above map, below top bar
+top_level_layout.add_widget(map_view)
 banner.start()
 
 # on app stop:
