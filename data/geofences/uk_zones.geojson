@@ -1,0 +1,97 @@
+{
+  "type": "FeatureCollection",
+  "metadata": {
+    "schema_version": "1.0",
+    "coordinate_order": "GeoJSON standard: [longitude, latitude]",
+    "default_center": [-0.4092, 52.9959],
+    "default_center_name": "Sleaford, Lincolnshire, UK",
+    "default_radius_km": 15,
+    "generated_by": "manual_template",
+    "warning": "Zone geometries are APPROXIMATE, hand-estimated for UI/testing defaults centered on Sleaford. RAF Cranwell is active military airspace — do NOT use this file for real flight planning. Verify against CAA AIP / OpenAIP / NOTAM sources before operational use."
+  },
+  "features": [
+    {
+      "type": "Feature",
+      "properties": {
+        "id": "aoi-sleaford-default-001",
+        "name": "Sleaford — Default Area of Interest",
+        "type": "area_of_interest",
+        "verified": true,
+        "source": "manual_template",
+        "effective_from": null,
+        "expiry": null,
+        "notes": "Non-restrictive reference bounding box used for default map centering and offline tile pre-seeding radius. Not an airspace restriction."
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [-0.6337, 52.8609],
+            [-0.1847, 52.8609],
+            [-0.1847, 53.1309],
+            [-0.6337, 53.1309],
+            [-0.6337, 52.8609]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": "matz-cranwell-approx-002",
+        "name": "RAF Cranwell ATZ/MATZ (approximate)",
+        "type": "military_atz",
+        "verified": false,
+        "source": "manual_template",
+        "effective_from": null,
+        "expiry": null,
+        "notes": "Active military airfield ~2.5nm radius approximation. Real MATZ geometry, stub masts, and NOTAM'd activity periods must be sourced from UK AIP ENR 5.2 / OpenAIP before use. HIGH PRIORITY for verification."
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [-0.4877, 53.07243],
+            [-0.43909, 53.06033],
+            [-0.41897, 53.0311],
+            [-0.43909, 53.00187],
+            [-0.4877, 52.98977],
+            [-0.53631, 53.00187],
+            [-0.55643, 53.0311],
+            [-0.53631, 53.06033],
+            [-0.4877, 53.07243]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": {
+        "id": "airfield-digby-nonactive-003",
+        "name": "RAF Digby (station active, runways non-active)",
+        "type": "airfield_non_active_runways",
+        "verified": false,
+        "source": "manual_template",
+        "effective_from": null,
+        "expiry": null,
+        "notes": "RAF Digby remains an active RAF station (ISTAR/comms role) but has no active flying operations or maintained runways. Excluded from runway heading indicators per airspace_manager.py non-active airfield list. Shown here for map context only."
+      },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [-0.5539, 53.10907],
+            [-0.53803, 53.10513],
+            [-0.53146, 53.0956],
+            [-0.53803, 53.08607],
+            [-0.5539, 53.08213],
+            [-0.56977, 53.08607],
+            [-0.57634, 53.0956],
+            [-0.56977, 53.10513],
+            [-0.5539, 53.10907]
+          ]
+        ]
+      }
+    }
+  ]
+}
