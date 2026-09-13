@@ -44,6 +44,18 @@ from modules.airspace_manager import AirspaceManager
 from modules.unverified_zone_banner import UnverifiedZoneBanner
 from modules.icons import get_icon_path, validate_icon_assets, ICON_UNKNOWN, ICON_OWNSHIP
 from modules.disclaimer_splash import show_disclaimer_if_needed
+from modules.freshness_badge import FreshnessBadge
+
+class AirspaceApp(App):
+    def build(self):
+        ...
+        badge = FreshnessBadge(
+            app=self,  # uses DefaultAggregator until sync_metadata.py exists
+            retry_callback=lambda: self.airspace_manager.force_resync(),
+            poll_interval_s=5.0,
+        )
+        top_bar.add_widget(badge)
+        ...
 
 class AirspaceApp(App):
     def on_start(self):
