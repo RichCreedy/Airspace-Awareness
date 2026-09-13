@@ -42,15 +42,7 @@ from modules.bluetooth_scanner import BluetoothScanner
 from modules.adsb_poller import ADSBPoller
 from modules.airspace_manager import AirspaceManager
 from modules.unverified_zone_banner import UnverifiedZoneBanner
-from modules.icons import (
-    ICON_PLANE_BLUE,
-    ICON_DRONE_ORANGE,
-    ICON_DRONE_PURPLE,
-    ICON_DRONE_CROSS_VERIFIED,
-    ICON_DRONE_SINGLE_SOURCE,
-    ICON_UNKNOWN,
-    ICON_OWNSHIP,
-)
+from modules.icons import get_icon_path, validate_icon_assets, ICON_UNKNOWN, ICON_OWNSHIP
 
 logging.basicConfig(
     level=logging.INFO,
@@ -434,7 +426,7 @@ class AirspaceApp(App):
             track_id = track["id"]
             seen_ids.add(track_id)
 
-            icon_path = ICON_PATHS.get(track.get("icon"), ICON_PATHS[ICON_UNKNOWN])
+            icon_path = get_icon_path(track.get("icon"))   # was: ICON_PATHS.get(track.get("icon"), ICON_PATHS[ICON_UNKNOWN])
 
             if track_id in self._marker_lookup:
                 marker = self._marker_lookup[track_id]
@@ -462,7 +454,7 @@ class AirspaceApp(App):
         else:
             marker = MapMarker(
                 lat=gps_fix["lat"], lon=gps_fix["lon"],
-                source=ICON_PATHS[ICON_OWNSHIP],
+                source=get_icon_path(ICON_OWNSHIP)
             )
             self._marker_lookup["ownship"] = marker
             self.mapview.add_marker(marker)
