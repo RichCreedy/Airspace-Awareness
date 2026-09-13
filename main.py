@@ -45,12 +45,13 @@ from modules.unverified_zone_banner import UnverifiedZoneBanner
 from modules.icons import get_icon_path, validate_icon_assets, ICON_UNKNOWN, ICON_OWNSHIP
 from modules.disclaimer_splash import show_disclaimer_if_needed
 from modules.freshness_badge import FreshnessBadge
+import modules.sync_metadata as sync_metadata
 
 class AirspaceApp(App):
     def build(self):
         ...
         badge = FreshnessBadge(
-            app=self,  # uses DefaultAggregator until sync_metadata.py exists
+            status_provider=lambda: sync_metadata.get_freshness_status(self),
             retry_callback=lambda: self.airspace_manager.force_resync(),
             poll_interval_s=5.0,
         )
