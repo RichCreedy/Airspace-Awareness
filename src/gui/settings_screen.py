@@ -8,7 +8,13 @@ from kivy.uix.button import Button
 from kivy.uix.label import Label
 from kivy.uix.slider import Slider
 
-from src.gui.disclaimer_splash import DisclaimerSplash
+from modules.disclaimer_splash import show_disclaimer_if_needed
+
+Button(
+    text="Show Safety Disclaimer",
+    on_release=lambda *a: show_disclaimer_if_needed(force=True),
+)
+
 
 
 class SettingsScreen(Screen):
