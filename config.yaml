@@ -20,7 +20,7 @@ gps:
 # ---------------------------------------------------------
 adsb:
   enabled: true
-  url: "http://localhost/tar1090/data/aircraft.json"
+  url: "http://127.0.0.1/tar1090/data/aircraft.json"
   poll_interval_s: 2
 
 # ---------------------------------------------------------
