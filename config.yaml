@@ -1,59 +1,127 @@
+# =========================================================
+# uConsole Airspace Awareness Tool — Configuration
+# =========================================================
+
+project:
+  name: "Airspace Awareness"
+  contact: "info@gr8computerservices.co.uk"
+
+# ---------------------------------------------------------
+# GPS (Ai-Thinker GP-02 via GPIO UART)
+# ---------------------------------------------------------
 gps:
-  gpsd_host: localhost
-  gpsd_port: 2947
-  reconnect_delay_s: 5
-  poll_timeout_s: 0.5
-  fix_timeout_s: 10          # used by fusion.py
-  
+  device: "/dev/ttyAMA0"
+  baud: 9600
+  use_gpsd: true
+  stale_timeout_s: 10
+
+# ---------------------------------------------------------
+# ADS-B (tar1090 / readsb aircraft.json)
+# ---------------------------------------------------------
 adsb:
-  url: "http://127.0.0.1/tar1090/data/aircraft.json"   # ⚠️ verify exact path
+  enabled: true
+  url: "http://localhost/tar1090/data/aircraft.json"
   poll_interval_s: 2
-  timeout_s: 3
-  backoff_base_s: 2
-  backoff_max_s: 60
-  stale_after_s: 30          # used by fusion.py
 
-wifi:
-  interface: wlan1mon
-  sniff_burst_s: 1
+# ---------------------------------------------------------
+# Passive WiFi Remote ID Detection (scapy, monitor mode)
+# ---------------------------------------------------------
+wifi_remoteid:
+  enabled: true
+  interface: "wlan1mon"
+  channel_hop: true
+  channels: [1, 6, 11]
 
-bluetooth:
-  adapter: null              # null = Bleak default adapter
-  scan_restart_s: 30
+# ---------------------------------------------------------
+# Bluetooth Remote ID Detection (Bleak)
+# ---------------------------------------------------------
+bluetooth_remoteid:
+  enabled: true
+  adapter: null   # null = system default adapter
+  scan_interval_s: 5
 
-tiles:
-  mode: hybrid            # online | offline | hybrid
-  cache_dir: data/tiles
-  online_check_url: "https://tile.openstreetmap.org/0/0/0.png"
-  seed_radius_km: 25
-  tile_server_url: "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+# ---------------------------------------------------------
+# 🆕 UPDATED: Map / Tile Sourcing — Default Center: Sleaford
+# ---------------------------------------------------------
+map:
+  default_center:
+    lat: 52.9959
+    lon: -0.4092
+    name: "Sleaford, Lincolnshire, UK"
+  default_zoom: 11
 
-airspace:
-  geofence_path: data/geofences/uk_zones.geojson
-  notam_dir: data/notam
-  auto_refresh:
+  tiles:
+    mode: "hybrid"              # "online" | "offline" | "hybrid"
+    online_url: "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+    offline_path: "data/tiles/{z}/{x}/{y}.png"
+    auto_switch: true
+    connectivity_check_interval_s: 30
+
+  # 🆕 UPDATED: Pre-seeding radius centered on Sleaford
+  preseed:
     enabled: true
-    interval_min: 60
-    backoff_max_min: 240
+    center_lat: 52.9959
+    center_lon: -0.4092
+    radius_km: 15
+    zoom_levels: [8, 10, 12, 14]
+
+# ---------------------------------------------------------
+# Airspace / Geofence / NOTAM Management
+# ---------------------------------------------------------
+airspace:
+  static_zones_path: "data/geofences/uk_zones.geojson"
+  frz_source_path: "data/geofences/frz_source.json"
+  frz_generated_path: "data/geofences/frz_generated.geojson"
+  manual_import_dir: "data/geofences/manual_import/"
+
+  remote_sync:
+    enabled: false               # flip true once openaip_sync.py is implemented
+    sources:
+      - name: "openaip"
+        url: "https://api.core.openaip.net/api/airspaces"
+        api_key: ""
+    refresh_interval_s: 3600
+    backoff_initial_s: 30
+    backoff_max_s: 1800
+
+  expiry:
+    prune_interval_s: 300
+
+  runways:
+    data_path: "data/runways/uk_runways.json"
+    exclude_airfields:
+      - "RAF Digby"
+
+  # 🆕 UPDATED: Proximity alert defaults tuned for Sleaford AOI
   proximity_alert:
     enabled: true
-    radius_m: 5000
+    radius_km: 5
     check_interval_s: 15
-    snooze_minutes: 10
-  openaip:
-    api_key: "e4c323fcf6475153b43adca8a46300ef"            # TODO: fill in if using OpenAIP
-    endpoint: "https://api.core.openaip.net/api/airspaces"
+    snooze_default_min: 10
 
-disclaimer:
-  show_on_start: true
-  flag_file: "data/.disclaimer_dismissed"
+# ---------------------------------------------------------
+# Data Freshness / Sync Status
+# ---------------------------------------------------------
+freshness:
+  warn_after_s: 900
+  error_after_s: 3600
 
-fusion:
-  stale_timeout_sec: 30
+# ---------------------------------------------------------
+# GUI / Disclaimer
+# ---------------------------------------------------------
+gui:
+  disclaimer:
+    show_on_start: true
+    dismiss_persists: true
+    settings_toggle: true
 
-remoteid:
-  stale_after_s: 20          # used by fusion.py
+  refresh:
+    map_update_interval_s: 1
+    banner_update_interval_s: 15
 
-logging:
-  level: INFO
-  file: airspace.log
+  icons:
+    plane: "images/icons/plane_blue.png"
+    drone_verified: "images/icons/drone_orange.png"
+    drone_single_source: "images/icons/drone_purple.png"
+    unknown: "images/icons/unknown_grey.png"
+    ownship: "images/icons/ownship.png"
