@@ -48,12 +48,12 @@ CONFIG (expected in config.yaml, example):
             enabled: true
             type: "openaip_airspace"          # selects converter
             url: "https://api.core.openaip.net/api/airspaces"
-            api_key_env: "OPENAIP_API_KEY"     # read from environment
+            api_key_env: "e4c323fcf6475153b43adca8a46300ef"     # read from environment
             poll_interval_s: 86400
             params:
               country: "GB"
           - name: "notam_uk_geojson"
-            enabled: false
+            enabled: True
             type: "generic_notam_geojson"
             url: "https://example.invalid/notams.geojson"
             api_key_env: null
