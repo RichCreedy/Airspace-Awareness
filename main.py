@@ -43,6 +43,14 @@ from modules.adsb_poller import ADSBPoller
 from modules.airspace_manager import AirspaceManager
 from modules.unverified_zone_banner import UnverifiedZoneBanner
 from modules.icons import get_icon_path, validate_icon_assets, ICON_UNKNOWN, ICON_OWNSHIP
+from modules.disclaimer_splash import show_disclaimer_if_needed
+
+class AirspaceApp(App):
+    def on_start(self):
+        # fires after build(), so widget tree/window exists
+        show_disclaimer_if_needed(self.root)
+
+
 
 logging.basicConfig(
     level=logging.INFO,
