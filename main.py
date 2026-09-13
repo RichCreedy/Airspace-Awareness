@@ -1,378 +1,516 @@
-#!/usr/bin/env python3
 """
-main.py — Orchestrator entry point for the uConsole Airspace Awareness Tool
+main.py
+-------
+uConsole Airspace Awareness Tool — entry point.
 
-Startup order matters:
-    1. FusionEngine        (must exist before anything feeds it data)
-    2. Acquisition modules (GPS, ADS-B, WiFi, Bluetooth)
-    3. AirspaceManager      (NOTAM/NFZ sync + FRZ regeneration)
-    4. ProximityAlertMonitor (depends on fusion having GPS + zones)
-    5. GUI (Kivy)           (runs on the main thread, blocks until closed)
+Wires together:
+  - GPS reader (gpsd / /dev/ttyAMA0)
+  - Passive WiFi Remote ID sniffer (scapy, wlan1mon)
+  - Bluetooth Remote ID scanner (Bleak)
+  - ADS-B poller (tar1090 aircraft.json)
+  - Fusion layer (merges tracks, tracks GPS fix, prunes stale data)
+  - AirspaceManager (static + remote + manual NOTAM zones, runways, FRZ)
+  - ProximityAlert / UnverifiedZoneBanner (GPS-proximity zone warnings)
+  - Kivy + kivy_garden.mapview GUI
 
-Shutdown is the reverse order, and is idempotent — safe to call twice
-(e.g. once from Kivy's on_stop() and once from a finally block).
+NOTE: disclaimer_splash.py and freshness_badge.py are intentionally
+NOT wired in yet (see TODO markers below) — those are the next patch.
 """
 
-from __future__ import annotations
-
-import argparse
-import logging
-import logging.handlers
-import signal
+import os
 import sys
+import logging
 import threading
-from pathlib import Path
-
 import yaml
 
-from modules.fusion import FusionEngine
+from kivy.app import App
+from kivy.clock import Clock
+from kivy.uix.floatlayout import FloatLayout
+from kivy.uix.boxlayout import BoxLayout
+from kivy.uix.button import Button
+from kivy.uix.label import Label
+from kivy.uix.popup import Popup
+from kivy.uix.scrollview import ScrollView
+from kivy.graphics import Color, Line
+
+from kivy_garden.mapview import MapView, MapMarker, MapLayer
+
+from modules.fusion import Fusion
 from modules.gps_reader import GPSReader
-from modules.adsb_ingest import ADSBIngest
-from modules.wifi_capture import WiFiCapture
-from modules.bluetooth_capture import BluetoothCapture
+from modules.wifi_sniffer import WiFiSniffer
+from modules.bluetooth_scanner import BluetoothScanner
+from modules.adsb_poller import ADSBPoller
 from modules.airspace_manager import AirspaceManager
-from modules.proximity_alert_monitor import ProximityAlertMonitor
-from unverified_zone_banner import UnverifiedZoneBanner
+from modules.unverified_zone_banner import UnverifiedZoneBanner
+from modules.icons import (
+    ICON_PLANE_BLUE,
+    ICON_DRONE_ORANGE,
+    ICON_DRONE_PURPLE,
+    ICON_DRONE_CROSS_VERIFIED,
+    ICON_DRONE_SINGLE_SOURCE,
+    ICON_UNKNOWN,
+    ICON_OWNSHIP,
+)
 
-# after orchestrator + config are loaded:
-proximity_cfg = config.get("airspace", {}).get("proximity_alert", {})
-banner = UnverifiedZoneBanner(fusion=fusion, config=proximity_cfg)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger("main")
 
-top_level_layout.add_widget(top_bar)
-top_level_layout.add_widget(banner)      # 👈 above map, below top bar
-top_level_layout.add_widget(map_view)
-banner.start()
-
-# on app stop:
-banner.stop()
-
-LOG = logging.getLogger("main")
-
-DEFAULT_CONFIG_PATH = "config.yaml"
-REQUIRED_DIRS = [
-    "data/geofences",
-    "data/tiles",
-    "data/notam",
-    "logs",
-]
+CONFIG_PATH = os.environ.get("AIRSPACE_CONFIG", "config.yaml")
 
 
-# ----------------------------------------------------------------------
-# Logging
-# ----------------------------------------------------------------------
-def setup_logging(log_level: str, log_file: str | None):
-    level = getattr(logging, log_level.upper(), logging.INFO)
+# ---------------------------------------------------------------------
+# Config loading
+# ---------------------------------------------------------------------
 
-    root = logging.getLogger()
-    root.setLevel(level)
+DEFAULT_CONFIG = {
+    "gps": {
+        "mode": "gpsd",              # "gpsd" | "serial"
+        "serial_port": "/dev/ttyAMA0",
+        "baud": 9600,
+    },
+    "wifi": {
+        "enabled": True,
+        "interface": "wlan1mon",
+    },
+    "bluetooth": {
+        "enabled": True,
+        "adapter": None,
+    },
+    "adsb": {
+        "enabled": True,
+        "url": "http://localhost/tar1090/data/aircraft.json",
+        "poll_interval_s": 2.0,
+    },
+    "airspace": {
+        "static_zones_path": "data/geofences/uk_zones.geojson",
+        "manual_import_dir": "data/geofences/manual_import/",
+        "remote_cache_dir": "data/geofences/remote_cache/",
+        "refresh_interval_s": 60,
+        "backoff_max_s": 900,
+        "exclude_airfields": ["Digby"],
+        "proximity_alert": {
+            "enabled": True,
+            "radius_m": 5000,
+            "check_interval_s": 15,
+        },
+    },
+    "tiles": {
+        "mode": "hybrid",             # "offline" | "online" | "hybrid"
+        "offline_dir": "data/tiles/",
+    },
+}
 
-    fmt = logging.Formatter(
-        "%(asctime)s %(levelname)-8s [%(threadName)s] %(name)s: %(message)s"
-    )
 
-    console = logging.StreamHandler(sys.stdout)
-    console.setFormatter(fmt)
-    root.addHandler(console)
-
-    if log_file:
-        Path(log_file).parent.mkdir(parents=True, exist_ok=True)
-        file_handler = logging.handlers.RotatingFileHandler(
-            log_file, maxBytes=5 * 1024 * 1024, backupCount=3
-        )
-        file_handler.setFormatter(fmt)
-        root.addHandler(file_handler)
-
-    # Quiet down noisy third-party libs unless we're debugging
-    if level > logging.DEBUG:
-        logging.getLogger("bleak").setLevel(logging.WARNING)
-        logging.getLogger("scapy").setLevel(logging.WARNING)
-        logging.getLogger("urllib3").setLevel(logging.WARNING)
-
-
-# ----------------------------------------------------------------------
-# Config
-# ----------------------------------------------------------------------
 def load_config(path: str) -> dict:
-    cfg_path = Path(path)
-    if not cfg_path.exists():
-        LOG.error("Config file not found: %s", cfg_path)
-        sys.exit(1)
+    if not os.path.exists(path):
+        logger.warning(f"[main] config file {path} not found — using defaults")
+        return DEFAULT_CONFIG
 
-    with open(cfg_path, "r") as f:
-        config = yaml.safe_load(f) or {}
+    with open(path, "r") as f:
+        user_cfg = yaml.safe_load(f) or {}
 
-    # ⚠️ Minimal sanity check only — a proper config validation script
-    # against a schema is still an open item (see OPEN_QUESTIONS).
-    required_top_level = ["gps", "adsb", "wifi", "bluetooth", "airspace"]
-    missing = [k for k in required_top_level if k not in config]
-    if missing:
-        LOG.warning("Config is missing top-level sections: %s — "
-                     "affected modules will fall back to hardcoded defaults", missing)
+    def deep_merge(base: dict, override: dict) -> dict:
+        result = dict(base)
+        for k, v in override.items():
+            if isinstance(v, dict) and isinstance(result.get(k), dict):
+                result[k] = deep_merge(result[k], v)
+            else:
+                result[k] = v
+        return result
 
-    return config
-
-
-def ensure_directories():
-    for d in REQUIRED_DIRS:
-        Path(d).mkdir(parents=True, exist_ok=True)
+    return deep_merge(DEFAULT_CONFIG, user_cfg)
 
 
-# ----------------------------------------------------------------------
-# Orchestrator
-# ----------------------------------------------------------------------
-class Orchestrator:
+# ---------------------------------------------------------------------
+# Icon lookup for track markers
+# ---------------------------------------------------------------------
+
+ICON_PATHS = {
+    ICON_PLANE_BLUE: "images/icons/plane_blue.png",
+    ICON_DRONE_ORANGE: "images/icons/drone_orange.png",
+    ICON_DRONE_PURPLE: "images/icons/drone_purple.png",
+    ICON_DRONE_CROSS_VERIFIED: "images/icons/drone_purple.png",   # verified badge variant
+    ICON_DRONE_SINGLE_SOURCE: "images/icons/drone_orange.png",
+    ICON_UNKNOWN: "images/icons/unknown_grey.png",
+    ICON_OWNSHIP: "images/icons/ownship.png",
+}
+
+
+# ---------------------------------------------------------------------
+# Zone overlay layer — draws geofence polygons on the MapView
+# ---------------------------------------------------------------------
+
+class ZoneOverlay(MapLayer):
     """
-    Owns the lifecycle of every backend module. The GUI is given a
-    reference to this object (not the other way around) so it can:
-      - call orchestrator.fusion.get_snapshot() every render tick
-      - call orchestrator.get_module_statuses() for the freshness badge
-      - call orchestrator.airspace_manager.manual_retry() from a "retry" button
-      - call orchestrator.stop() on window close
+    Draws zone polygons on top of the map, colored by verified status,
+    and exposes hit-testing for tap-to-inspect.
+
+    Verified zones -> solid outline.
+    Unverified/approximate zones -> dashed-look outline (approximated
+    via alpha) + "⚠️ Approximate FRZ — verified: false" label handled
+    by the popup, not drawn permanently on the canvas (keeps the map
+    readable at small zoom levels).
     """
 
-    def __init__(self, config: dict):
-        self.config = config
-        self._started = False
-        self._stopped = False
-        self._lock = threading.Lock()
+    def __init__(self, get_zones_callback, **kwargs):
+        super().__init__(**kwargs)
+        self.get_zones_callback = get_zones_callback
+        self._zones_cache = []
 
-        # 1. Fusion hub — must exist before anything else is constructed,
-        #    since every acquisition module's callback points into it.
-        self.fusion = FusionEngine(config)
+    def reposition(self):
+        self.canvas.clear()
+        zones = self.get_zones_callback()
+        self._zones_cache = zones
 
-        # 2. Acquisition modules
-        self.gps = GPSReader(config, on_fix=self.fusion.update_gps_fix)
-        self.adsb = ADSBIngest(config, on_update=self.fusion.update_adsb_tracks)
-        self.wifi = WiFiCapture(config, on_detection=self.fusion.update_remoteid_track)
-        self.bluetooth = BluetoothCapture(config, on_detection=self.fusion.update_remoteid_track)
+        mapview = self.parent
+        if mapview is None:
+            return
 
-        # 3. Airspace / NOTAM / FRZ management
-        #    on_zones_updated feeds parsed GeoJSON features straight into fusion.
-        #    ⚠️ Assumed interface — see flags below main.py listing.
+        with self.canvas:
+            for zone in zones:
+                geometry = zone.get("geometry")
+                if not geometry or geometry.get("type") != "Polygon":
+                    continue
+
+                verified = zone.get("verified", True)
+                color = (0.2, 0.8, 0.2, 0.6) if verified else (0.9, 0.6, 0.0, 0.6)
+                Color(*color)
+
+                for ring in geometry.get("coordinates", []):
+                    points = []
+                    for lon, lat in ring:
+                        x, y = mapview.get_window_xy_from(lat, lon, mapview.zoom)
+                        points.extend([x, y])
+                    if len(points) >= 4:
+                        Line(points=points, width=1.5, close=True)
+
+    def point_in_zones(self, lat: float, lon: float) -> list:
+        """Returns all cached zones whose polygon contains (lat, lon)."""
+        hits = []
+        for zone in self._zones_cache:
+            geometry = zone.get("geometry")
+            if geometry and geometry.get("type") == "Polygon":
+                if self._point_in_polygon(lat, lon, geometry["coordinates"][0]):
+                    hits.append(zone)
+        return hits
+
+    @staticmethod
+    def _point_in_polygon(lat, lon, ring) -> bool:
+        """Standard ray-casting point-in-polygon test."""
+        inside = False
+        n = len(ring)
+        j = n - 1
+        for i in range(n):
+            xi, yi = ring[i]
+            xj, yj = ring[j]
+            if ((yi > lat) != (yj > lat)) and (
+                lon < (xj - xi) * (lat - yi) / (yj - yi + 1e-12) + xi
+            ):
+                inside = not inside
+            j = i
+        return inside
+
+
+# ---------------------------------------------------------------------
+# Stacked zone popup (shown on tap)
+# ---------------------------------------------------------------------
+
+def show_zone_popup(zones: list):
+    """
+    Scrollable popup listing every zone at the tapped point.
+    Each row flags "⚠️ Approximate FRZ — verified: false" when
+    zone.get('verified') is False.
+    """
+    root = BoxLayout(orientation="vertical", size_hint_y=None)
+    root.bind(minimum_height=root.setter("height"))
+
+    if not zones:
+        root.add_widget(Label(text="No zones at this location.", size_hint_y=None, height=40))
+    else:
+        for zone in zones:
+            verified = zone.get("verified", True)
+            name = zone.get("name", "Unnamed Zone")
+            category = zone.get("category", "UNKNOWN")
+
+            row = BoxLayout(orientation="vertical", size_hint_y=None, height=70, padding=4)
+            row.add_widget(Label(text=f"[b]{name}[/b]  ({category})", markup=True,
+                                  size_hint_y=None, height=25))
+            if not verified:
+                row.add_widget(Label(
+                    text="⚠️ Approximate FRZ — verified: false",
+                    color=(1, 0.6, 0, 1),
+                    size_hint_y=None, height=25,
+                ))
+            else:
+                row.add_widget(Label(text="✅ verified", size_hint_y=None, height=25))
+            root.add_widget(row)
+
+    scroll = ScrollView(size_hint=(1, 1))
+    scroll.add_widget(root)
+
+    popup = Popup(
+        title=f"{len(zones)} zone(s) at this location" if zones else "No zones here",
+        content=scroll,
+        size_hint=(0.85, 0.7),
+    )
+    popup.open()
+
+
+# ---------------------------------------------------------------------
+# Main Kivy App
+# ---------------------------------------------------------------------
+
+class AirspaceApp(App):
+    def __init__(self, config: dict, **kwargs):
+        super().__init__(**kwargs)
+        self.config_data = config
+        self._marker_lookup = {}   # track_id -> MapMarker instance
+
+        # --- Core data modules -------------------------------------
+        self.fusion = Fusion()
+
+        self.gps_reader = GPSReader(
+            mode=config["gps"]["mode"],
+            serial_port=config["gps"]["serial_port"],
+            baud=config["gps"]["baud"],
+            on_fix=self.fusion.update_gps_fix,
+        )
+
+        self.wifi_sniffer = None
+        if config["wifi"]["enabled"]:
+            self.wifi_sniffer = WiFiSniffer(
+                interface=config["wifi"]["interface"],
+                on_track=self.fusion.update_wifi_track,
+            )
+
+        self.bt_scanner = None
+        if config["bluetooth"]["enabled"]:
+            self.bt_scanner = BluetoothScanner(
+                adapter=config["bluetooth"]["adapter"],
+                on_track=self.fusion.update_bt_track,
+            )
+
+        self.adsb_poller = None
+        if config["adsb"]["enabled"]:
+            self.adsb_poller = ADSBPoller(
+                url=config["adsb"]["url"],
+                poll_interval_s=config["adsb"]["poll_interval_s"],
+                on_tracks=self.fusion.update_adsb_tracks,
+            )
+
         self.airspace_manager = AirspaceManager(
-            config,
+            static_zones_path=config["airspace"]["static_zones_path"],
+            manual_import_dir=config["airspace"]["manual_import_dir"],
+            remote_cache_dir=config["airspace"]["remote_cache_dir"],
+            refresh_interval_s=config["airspace"]["refresh_interval_s"],
+            backoff_max_s=config["airspace"]["backoff_max_s"],
+            exclude_airfields=config["airspace"]["exclude_airfields"],
             on_zones_updated=self.fusion.update_zones,
         )
 
-        # 4. Proximity alerting — reads GPS fix + zones from fusion,
-        #    writes alerts back into fusion for the GUI banner to consume.
-        self.proximity_monitor = ProximityAlertMonitor(
-            config,
-            fusion=self.fusion,
+        self._threads_started = False
+
+    # -------------------------------------------------------------
+    # Lifecycle
+    # -------------------------------------------------------------
+
+    def build(self):
+        self.title = "uConsole Airspace Awareness"
+
+        root = FloatLayout()
+
+        # --- Map --------------------------------------------------
+        self.mapview = MapView(zoom=12, lat=51.5, lon=-0.1)
+        self.mapview.bind(on_touch_up=self._on_map_touch)
+        root.add_widget(self.mapview)
+
+        # --- Zone overlay ------------------------------------------
+        self.zone_overlay = ZoneOverlay(get_zones_callback=self.airspace_manager.get_zones)
+        self.mapview.add_layer(self.zone_overlay)
+
+        # --- Top bar -------------------------------------------------
+        top_bar = BoxLayout(
+            orientation="horizontal",
+            size_hint=(1, None),
+            height=48,
+            pos_hint={"top": 1},
         )
+        top_bar.add_widget(Label(text="🛰️ Airspace Awareness", bold=True))
 
-        self._acquisition_modules = [self.gps, self.adsb, self.wifi, self.bluetooth]
+        # TODO(freshness_badge): mount FreshnessBadge widget here once
+        # freshness_badge.py exists, wired to sync_metadata aggregator.
+        top_bar.add_widget(Label(text="[freshness badge placeholder]"))
 
-    # ------------------------------------------------------------------
-    def start(self):
-        with self._lock:
-            if self._started:
-                LOG.warning("Orchestrator.start() called twice — ignoring")
-                return
-            self._started = True
+        retry_btn = Button(text="🔄 Retry Sync", size_hint=(None, 1), width=140)
+        retry_btn.bind(on_release=lambda *_: self._on_manual_retry())
+        top_bar.add_widget(retry_btn)
 
-        LOG.info("Starting FusionEngine...")
-        self.fusion.start()
+        settings_btn = Button(text="⚙️", size_hint=(None, 1), width=48)
+        settings_btn.bind(on_release=lambda *_: self._open_settings())
+        top_bar.add_widget(settings_btn)
 
-        LOG.info("Starting acquisition modules...")
-        for mod in self._acquisition_modules:
-            try:
-                mod.start()
-            except Exception:
-                LOG.exception("Failed to start %s — continuing without it",
-                               type(mod).__name__)
+        root.add_widget(top_bar)
 
-        LOG.info("Starting AirspaceManager...")
-        try:
-            self.airspace_manager.start()
-        except Exception:
-            LOG.exception("Failed to start AirspaceManager")
+        # --- Unverified zone banner (below top bar) -----------------
+        prox_cfg = self.config_data["airspace"]["proximity_alert"]
+        self.zone_banner = UnverifiedZoneBanner(
+            get_zones_callback=self.airspace_manager.get_zones,
+            get_gps_fix_callback=self.fusion.get_gps_fix,
+            radius_m=prox_cfg["radius_m"],
+            check_interval_s=prox_cfg["check_interval_s"],
+            enabled=prox_cfg["enabled"],
+            on_tap_view_details=self._on_banner_tapped,
+            pos_hint={"top": 1 - (48 / self.mapview.height if self.mapview.height else 0.93)},
+            size_hint=(1, None),
+            height=36,
+        )
+        root.add_widget(self.zone_banner)
 
-        LOG.info("Starting ProximityAlertMonitor...")
-        try:
-            self.proximity_monitor.start()
-        except Exception:
-            LOG.exception("Failed to start ProximityAlertMonitor")
+        # TODO(disclaimer_splash): show DisclaimerSplash on first launch
+        # (or every launch until "don't show again" is set), before/over
+        # this root widget. Wire in main() below once written.
 
-        LOG.info("Orchestrator started")
+        Clock.schedule_interval(self._update_loop, 1.0)
 
-    def stop(self):
-        with self._lock:
-            if self._stopped or not self._started:
-                return
-            self._stopped = True
+        return root
 
-        LOG.info("Stopping ProximityAlertMonitor...")
-        self._safe_stop(self.proximity_monitor)
+    def on_start(self):
+        self._start_background_threads()
 
-        LOG.info("Stopping AirspaceManager...")
-        self._safe_stop(self.airspace_manager)
+    def on_stop(self):
+        self._stop_background_threads()
 
-        LOG.info("Stopping acquisition modules...")
-        for mod in self._acquisition_modules:
-            self._safe_stop(mod)
+    # -------------------------------------------------------------
+    # Background threads
+    # -------------------------------------------------------------
 
-        LOG.info("Stopping FusionEngine...")
-        self._safe_stop(self.fusion)
+    def _start_background_threads(self):
+        if self._threads_started:
+            return
 
-        LOG.info("Orchestrator stopped cleanly")
+        self.gps_reader.start()
 
-    @staticmethod
-    def _safe_stop(module):
-        try:
-            module.stop()
-        except Exception:
-            LOG.exception("Error stopping %s", type(module).__name__)
+        if self.wifi_sniffer:
+            self.wifi_sniffer.start()
 
-    # ------------------------------------------------------------------
-    def get_module_statuses(self) -> dict:
-        """
-        Aggregated status dict for the freshness badge / settings screen.
-        Every acquisition module + airspace_manager exposes get_status()
-        with a consistent shape (see previous message's module set).
-        """
-        return {
-            "gps": self.gps.get_status(),
-            "adsb": self.adsb.get_status(),
-            "wifi": self.wifi.get_status(),
-            "bluetooth": self.bluetooth.get_status(),
-            "airspace": self.airspace_manager.get_status(),
-            "proximity": self.proximity_monitor.get_status(),
-        }
+        if self.bt_scanner:
+            self.bt_scanner.start()
 
-    def manual_retry_airspace(self):
-        """Wired to a 'retry' button in the freshness badge popup."""
-        LOG.info("Manual airspace retry requested from GUI")
-        self.airspace_manager.manual_retry()
+        if self.adsb_poller:
+            self.adsb_poller.start()
 
+        self.airspace_manager.start()
 
-# ----------------------------------------------------------------------
-# Signal handling (headless / non-GUI shutdown path)
-# ----------------------------------------------------------------------
-_shutdown_event = threading.Event()
+        self._threads_started = True
+        logger.info("[main] all background modules started")
 
+    def _stop_background_threads(self):
+        for mod in (self.gps_reader, self.wifi_sniffer, self.bt_scanner,
+                    self.adsb_poller, self.airspace_manager):
+            if mod is not None:
+                try:
+                    mod.stop()
+                except Exception as e:
+                    logger.warning(f"[main] error stopping {mod}: {e}")
+        logger.info("[main] all background modules stopped")
 
-def _handle_signal(signum, frame):
-    LOG.info("Received signal %s — requesting shutdown", signum)
-    _shutdown_event.set()
+    # -------------------------------------------------------------
+    # GUI update loop
+    # -------------------------------------------------------------
 
+    def _update_loop(self, dt):
+        snapshot = self.fusion.get_snapshot()
+        self._update_markers(snapshot["tracks"])
+        self._update_ownship(snapshot["gps"])
+        self.zone_overlay.reposition()
 
-# ----------------------------------------------------------------------
-# Headless run loop (--no-gui)
-# ----------------------------------------------------------------------
-def _run_headless(orchestrator: Orchestrator):
-    """
-    Backend-only loop for --no-gui mode. Blocks until SIGINT/SIGTERM,
-    logging a periodic status summary so this is usable for dev-hardware
-    smoke testing (e.g. over SSH, no display attached).
-    """
-    STATUS_INTERVAL_S = 30
-    elapsed_since_status = 0.0
+    def _update_markers(self, tracks: list):
+        seen_ids = set()
 
-    LOG.info("Running headless — backend only. Press Ctrl+C to exit.")
+        for track in tracks:
+            track_id = track["id"]
+            seen_ids.add(track_id)
 
-    while not _shutdown_event.is_set():
-        # wait() acts as both the sleep and the early-exit trigger
-        _shutdown_event.wait(timeout=1.0)
-        elapsed_since_status += 1.0
+            icon_path = ICON_PATHS.get(track.get("icon"), ICON_PATHS[ICON_UNKNOWN])
 
-        if elapsed_since_status >= STATUS_INTERVAL_S:
-            elapsed_since_status = 0.0
-            try:
-                LOG.info("Status: %s", orchestrator.get_module_statuses())
-            except Exception:
-                LOG.exception("Failed to fetch module statuses")
+            if track_id in self._marker_lookup:
+                marker = self._marker_lookup[track_id]
+                marker.lat = track["lat"]
+                marker.lon = track["lon"]
+            else:
+                marker = MapMarker(lat=track["lat"], lon=track["lon"], source=icon_path)
+                self._marker_lookup[track_id] = marker
+                self.mapview.add_marker(marker)
 
-    LOG.info("Headless shutdown requested — exiting run loop")
+        # Remove markers for tracks that have dropped out (pruned by fusion)
+        stale_ids = set(self._marker_lookup.keys()) - seen_ids - {"ownship"}
+        for stale_id in stale_ids:
+            marker = self._marker_lookup.pop(stale_id)
+            self.mapview.remove_marker(marker)
 
+    def _update_ownship(self, gps_fix: dict):
+        if not gps_fix or gps_fix.get("lat") is None:
+            return
 
-# ----------------------------------------------------------------------
-# GUI run path
-# ----------------------------------------------------------------------
-def _run_gui(orchestrator: Orchestrator) -> int:
-    """
-    Launches the Kivy GUI on the main thread.
-
-    Imported lazily so that --no-gui mode (and any CI / headless test
-    runs) never has to import Kivy or touch a display, even indirectly.
-
-    ⚠️ ASSUMPTION (please confirm/correct): `gui/app.py` defines
-    `AirspaceGUIApp`, a `kivy.app.App` subclass whose constructor takes
-    the `orchestrator` instance, and whose build()/on_start() wire up:
-        - MapView + zone overlay + aircraft/ownship markers, driven by
-          orchestrator.fusion.get_snapshot()
-        - FreshnessBadge, driven by orchestrator.get_module_statuses()
-          and orchestrator.manual_retry_airspace()
-        - UnverifiedZoneBanner, driven by proximity data from
-          orchestrator.fusion / orchestrator.proximity_monitor
-        - DisclaimerSplash on first launch and via a Settings screen
-        - Zone-tap and runway-tap popups via
-          orchestrator.airspace_manager.get_zones() / .get_runways()
-        - App.on_stop() calling orchestrator.stop()
-
-    This file/class hasn't been drafted or confirmed yet — flag if the
-    module path, class name, or constructor signature should differ.
-    """
-    from gui.app import AirspaceGUIApp  # local import — see docstring
-
-    app = AirspaceGUIApp(orchestrator)
-    app.run()
-    return 0
-
-
-# ----------------------------------------------------------------------
-# Entry point
-# ----------------------------------------------------------------------
-def main() -> int:
-    parser = argparse.ArgumentParser(description="uConsole Airspace Awareness Tool")
-    parser.add_argument("--config", default=DEFAULT_CONFIG_PATH,
-                         help="Path to config.yaml")
-    parser.add_argument("--log-level", default="INFO",
-                         choices=["DEBUG", "INFO", "WARNING", "ERROR"])
-    parser.add_argument("--log-file", default="logs/app.log",
-                         help="Set to empty string to disable file logging")
-    parser.add_argument("--no-gui", action="store_true",
-                         help="Run backend only, no Kivy window "
-                              "(useful for headless testing on dev hardware)")
-    args = parser.parse_args()
-
-    setup_logging(args.log_level, args.log_file or None)
-    ensure_directories()
-
-    LOG.info("Loading config from %s", args.config)
-    config = load_config(args.config)
-
-    orchestrator = Orchestrator(config)
-
-    # SIGTERM/SIGINT handling for the headless path. When the GUI is
-    # running, Kivy owns the main thread and its own window-close /
-    # Ctrl+C handling is what triggers App.on_stop() -> orchestrator.stop()
-    # instead — these handlers are the fallback for --no-gui mode.
-    #
-    # NOTE: your pasted file only registered SIGTERM — I've added SIGINT
-    # too so Ctrl+C works cleanly in --no-gui mode. Remove if that was
-    # intentionally deferred elsewhere.
-    signal.signal(signal.SIGTERM, _handle_signal)
-    signal.signal(signal.SIGINT, _handle_signal)
-
-    orchestrator.start()
-
-    exit_code = 0
-    try:
-        if args.no_gui:
-            _run_headless(orchestrator)
+        if "ownship" in self._marker_lookup:
+            marker = self._marker_lookup["ownship"]
+            marker.lat = gps_fix["lat"]
+            marker.lon = gps_fix["lon"]
         else:
-            exit_code = _run_gui(orchestrator)
-    except Exception:
-        LOG.exception("Unhandled exception in main run loop")
-        exit_code = 1
-    finally:
-        # Orchestrator.stop() is idempotent, so this is safe even if
-        # AirspaceGUIApp.on_stop() already called it.
-        orchestrator.stop()
+            marker = MapMarker(
+                lat=gps_fix["lat"], lon=gps_fix["lon"],
+                source=ICON_PATHS[ICON_OWNSHIP],
+            )
+            self._marker_lookup["ownship"] = marker
+            self.mapview.add_marker(marker)
 
-    return exit_code
+    # -------------------------------------------------------------
+    # Interaction handlers
+    # -------------------------------------------------------------
+
+    def _on_map_touch(self, mapview, touch):
+        if not mapview.collide_point(*touch.pos):
+            return False
+        if touch.is_double_tap or getattr(touch, "grab_current", None) is not None:
+            return False
+
+        # Long-press-free tap detection: only fire if touch didn't drag much.
+        if hasattr(touch, "ud") and touch.ud.get("dragged", False):
+            return False
+
+        lat, lon = mapview.get_latlon_at(touch.x, touch.y)
+        hits = self.zone_overlay.point_in_zones(lat, lon)
+        if hits:
+            show_zone_popup(hits)
+        return False
+
+    def _on_manual_retry(self):
+        logger.info("[main] manual sync retry requested from GUI")
+        results = self.airspace_manager.force_remote_sync()
+        logger.info(f"[main] manual retry results: {results}")
+
+    def _on_banner_tapped(self, nearby_zones: list):
+        show_zone_popup(nearby_zones)
+
+    def _open_settings(self):
+        # TODO(disclaimer_splash): settings screen should include a
+        # "Show safety disclaimer" button that re-triggers the splash
+        # on demand, per the persistent "don't show again" requirement.
+        logger.info("[main] settings opened (placeholder)")
+
+
+# ---------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------
+
+def main():
+    config = load_config(CONFIG_PATH)
+    app = AirspaceApp(config=config)
+    app.run()
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
